@@ -155,52 +155,52 @@ jobs:
           echo "has_changes=true" >> "$GITHUB_OUTPUT"
           echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
 
-      # --------------------------------------------------------
-      # 5. Per-env credentials (same role, different region)
-      # --------------------------------------------------------
-      - name: Resolve credentials
-        shell: bash
-        env:
-          ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
-          REGION_STAGING: ${{ secrets.AWS_REGION_STAGING }}
-          REGION_PROD: ${{ secrets.AWS_REGION_PROD }}
-        run: |
-          set -euo pipefail
-          case "$ENV_NAME" in
-            staging)    REGION="$REGION_STAGING" ;;
-            production) REGION="$REGION_PROD"    ;;
-            *) echo "ERROR: unknown env '$ENV_NAME'"; exit 1 ;;
-          esac
-          [ -n "$ROLE_ARN" ] || { echo "ERROR: AWS_ROLE_ARN secret not set"; exit 1; }
-          [ -n "$REGION"   ] || { echo "ERROR: region secret not set for $ENV_NAME"; exit 1; }
-          {
-            echo "AWS_ROLE_ARN=$ROLE_ARN"
-            echo "AWS_REGION=$REGION"
-          } >> "$GITHUB_ENV"
-          echo "Region: $REGION"
+      # # --------------------------------------------------------
+      # # 5. Per-env credentials (same role, different region)
+      # # --------------------------------------------------------
+      # - name: Resolve credentials
+      #   shell: bash
+      #   env:
+      #     ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      #     REGION_STAGING: ${{ secrets.AWS_REGION_STAGING }}
+      #     REGION_PROD: ${{ secrets.AWS_REGION_PROD }}
+      #   run: |
+      #     set -euo pipefail
+      #     case "$ENV_NAME" in
+      #       staging)    REGION="$REGION_STAGING" ;;
+      #       production) REGION="$REGION_PROD"    ;;
+      #       *) echo "ERROR: unknown env '$ENV_NAME'"; exit 1 ;;
+      #     esac
+      #     [ -n "$ROLE_ARN" ] || { echo "ERROR: AWS_ROLE_ARN secret not set"; exit 1; }
+      #     [ -n "$REGION"   ] || { echo "ERROR: region secret not set for $ENV_NAME"; exit 1; }
+      #     {
+      #       echo "AWS_ROLE_ARN=$ROLE_ARN"
+      #       echo "AWS_REGION=$REGION"
+      #     } >> "$GITHUB_ENV"
+      #     echo "Region: $REGION"
 
-      # --------------------------------------------------------
-      # 6. Assume role via OIDC
-      # --------------------------------------------------------
-      - name: Configure AWS credentials
-        if: steps.changes.outputs.has_changes == 'true'
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          role-to-assume: ${{ env.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+      # # --------------------------------------------------------
+      # # 6. Assume role via OIDC
+      # # --------------------------------------------------------
+      # - name: Configure AWS credentials
+      #   if: steps.changes.outputs.has_changes == 'true'
+      #   uses: aws-actions/configure-aws-credentials@v5
+      #   with:
+      #     role-to-assume: ${{ env.AWS_ROLE_ARN }}
+      #     aws-region: ${{ env.AWS_REGION }}
 
-      # --------------------------------------------------------
-      # 7. Verify the assumed identity
-      # --------------------------------------------------------
-      - name: Verify AWS identity
-        if: steps.changes.outputs.has_changes == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          ARN="$(aws sts get-caller-identity --query Arn --output text)"
-          echo "Assumed: $ARN"
-          EXPECTED="${AWS_ROLE_ARN##*/}"
-          [[ "$ARN" == *"$EXPECTED"* ]] || { echo "ERROR: unexpected role"; exit 1; }
+      # # --------------------------------------------------------
+      # # 7. Verify the assumed identity
+      # # --------------------------------------------------------
+      # - name: Verify AWS identity
+      #   if: steps.changes.outputs.has_changes == 'true'
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
+      #     ARN="$(aws sts get-caller-identity --query Arn --output text)"
+      #     echo "Assumed: $ARN"
+      #     EXPECTED="${AWS_ROLE_ARN##*/}"
+      #     [[ "$ARN" == *"$EXPECTED"* ]] || { echo "ERROR: unexpected role"; exit 1; }
 
       # --------------------------------------------------------
       # 8. Build + deploy each Lambda
