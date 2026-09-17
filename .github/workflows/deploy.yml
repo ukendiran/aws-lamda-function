@@ -12,6 +12,15 @@
 #   - Detect common/ and workflow changes
 #   - Generate an accurate deployment summary
 #
+# Flow:
+#   1. Resolve credentials (reads secrets — no AWS call)
+#   2. Set up Python
+#   3. Resolve base
+#   4. Detect changes (git-only — no AWS call)
+#   5. ONLY IF there are changes: configure AWS (OIDC) + verify
+#   6. Deploy
+#   7. Summary
+#
 # Important:
 #   - Does NOT use GitHub Environments.
 #   - Secrets are repository-level only.
@@ -111,6 +120,9 @@ jobs:
       # Switch on INPUT_ENVIRONMENT to pick the right region.
       # The AWS role ARN is shared between environments (OIDC).
       #
+      # ⚠️ This step ONLY reads secrets and exports env vars.
+      # It does NOT call AWS. No OIDC token is exchanged yet.
+      #
       # Exports:
       #   AWS_ROLE_ARN  (shared)
       #   AWS_REGION    (env-specific)
@@ -166,7 +178,7 @@ jobs:
             echo "AWS_REGION=$REGION"
           } >> "$GITHUB_ENV"
 
-          echo "Credentials resolved:"
+          echo "Credentials resolved (not yet assumed):"
           echo "  Environment : $INPUT_ENVIRONMENT"
           echo "  Region      : $REGION"
           echo "  Role        : $ROLE_ARN"
@@ -192,33 +204,6 @@ jobs:
           echo "=============================================="
 
       # ========================================================
-      # Configure AWS credentials (OIDC)
-      # ========================================================
-
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          role-to-assume: ${{ env.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      # ========================================================
-      # Verify AWS identity
-      # ========================================================
-
-      - name: Verify AWS identity
-        shell: powershell
-        run: |
-          $id = aws sts get-caller-identity | ConvertFrom-Json
-          Write-Host "Assumed ARN : $($id.Arn)"
-          Write-Host "Account     : $($id.Account)"
-          Write-Host "UserId      : $($id.UserId)"
-
-          $roleName = ("${{ env.AWS_ROLE_ARN }}" -split '/')[-1]
-          if ($id.Arn -notlike "*$roleName*") {
-            throw "Unexpected identity: $($id.Arn). Expected role containing '$roleName'."
-          }
-
-      # ========================================================
       # Setup Python
       # ========================================================
 
@@ -228,7 +213,7 @@ jobs:
           python-version: "3.12"
 
       # ========================================================
-      # Resolve comparison base
+      # Resolve comparison base  (git-only — no AWS)
       # ========================================================
 
       - name: Resolve comparison base
@@ -342,7 +327,7 @@ jobs:
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
       # ========================================================
-      # Detect changed functions (file-level)
+      # Detect changed functions  (git-only — no AWS)
       # ========================================================
 
       - name: Detect changed functions
@@ -602,6 +587,38 @@ jobs:
           echo "source=diff" >> "$GITHUB_OUTPUT"
 
       # ========================================================
+      # Configure AWS credentials (OIDC) — ONLY IF CHANGES EXIST
+      #
+      # This is the first step that actually talks to AWS.
+      # Runs only when has_changes == 'true'.
+      # ========================================================
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ========================================================
+      # Verify AWS identity — ONLY IF CHANGES EXIST
+      # ========================================================
+
+      - name: Verify AWS identity
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: powershell
+        run: |
+          $id = aws sts get-caller-identity | ConvertFrom-Json
+          Write-Host "Assumed ARN : $($id.Arn)"
+          Write-Host "Account     : $($id.Account)"
+          Write-Host "UserId      : $($id.UserId)"
+
+          $roleName = ("${{ env.AWS_ROLE_ARN }}" -split '/')[-1]
+          if ($id.Arn -notlike "*$roleName*") {
+            throw "Unexpected identity: $($id.Arn). Expected role containing '$roleName'."
+          }
+
+      # ========================================================
       # Deploy functions
       # ========================================================
 
@@ -727,6 +744,8 @@ jobs:
           BASE_SHA:         ${{ steps.base.outputs.base }}
           BASE_OUTCOME:     ${{ steps.base.outcome }}
           CHANGES_OUTCOME:  ${{ steps.changes.outcome }}
+          AWS_CONFIGURE_OUTCOME: ${{ steps.configure-aws.outcome }}
+          AWS_VERIFY_OUTCOME:    ${{ steps.verify-aws.outcome }}
           DEPLOY_OUTCOME:   ${{ steps.deploy.outcome }}
         run: |
           set -u
@@ -779,6 +798,8 @@ jobs:
               echo ""
               echo "No Lambda Function changes were detected."
               echo ""
+              echo "AWS credentials were not requested (change detection runs first)."
+              echo ""
 
             else
 
@@ -809,6 +830,31 @@ jobs:
 
                 echo ""
               fi
+
+              # --------------------------------------------------
+              # AWS authentication status
+              # --------------------------------------------------
+
+              echo "## AWS Authentication"
+              echo ""
+              echo "| Step | Result |"
+              echo "|---|---|"
+
+              case "${AWS_CONFIGURE_OUTCOME:-not-run}" in
+                success) echo "| Configure credentials | ✅ Assumed |" ;;
+                skipped) echo "| Configure credentials | ⏭️ Skipped |" ;;
+                failure) echo "| Configure credentials | ❌ Failed |" ;;
+                *)       echo "| Configure credentials | \`${AWS_CONFIGURE_OUTCOME:-not-run}\` |" ;;
+              esac
+
+              case "${AWS_VERIFY_OUTCOME:-not-run}" in
+                success) echo "| Verify identity | ✅ Verified |" ;;
+                skipped) echo "| Verify identity | ⏭️ Skipped |" ;;
+                failure) echo "| Verify identity | ❌ Failed |" ;;
+                *)       echo "| Verify identity | \`${AWS_VERIFY_OUTCOME:-not-run}\` |" ;;
+              esac
+
+              echo ""
 
               # --------------------------------------------------
               # Deployment status per function
