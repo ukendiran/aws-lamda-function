@@ -114,94 +114,7 @@ jobs:
           set -euo pipefail
           gh --version
 
-      # ========================================================
-      # Resolve environment-specific credentials
-      #
-      # Switch on INPUT_ENVIRONMENT to pick the right region.
-      # The AWS role ARN is shared between environments (OIDC).
-      #
-      # ⚠️ This step ONLY reads secrets and exports env vars.
-      # It does NOT call AWS. No OIDC token is exchanged yet.
-      #
-      # Exports:
-      #   AWS_ROLE_ARN  (shared)
-      #   AWS_REGION    (env-specific)
-      # to $GITHUB_ENV for later steps.
-      # ========================================================
-
-      - name: Resolve environment credentials
-        shell: bash
-        env:
-          SECRET_AWS_ROLE_ARN:       ${{ secrets.AWS_ROLE_ARN }}
-          SECRET_AWS_REGION_DEV:     ${{ secrets.AWS_REGION_DEV }}
-          SECRET_AWS_REGION_STAGING: ${{ secrets.AWS_REGION_STAGING }}
-          SECRET_AWS_REGION_PROD:    ${{ secrets.AWS_REGION_PROD }}
-        run: |
-          set -euo pipefail
-
-          echo "=============================================="
-          echo "Resolving credentials for: $INPUT_ENVIRONMENT"
-          echo "=============================================="
-
-          case "$INPUT_ENVIRONMENT" in
-            dev)
-              ROLE_ARN="$SECRET_AWS_ROLE_ARN"
-              REGION="$SECRET_AWS_REGION_DEV"
-              ;;
-            staging)
-              ROLE_ARN="$SECRET_AWS_ROLE_ARN"
-              REGION="$SECRET_AWS_REGION_STAGING"
-              ;;
-            prod)
-              ROLE_ARN="$SECRET_AWS_ROLE_ARN"
-              REGION="$SECRET_AWS_REGION_PROD"
-              ;;
-            *)
-              echo "ERROR: Unsupported environment: $INPUT_ENVIRONMENT"
-              exit 1
-              ;;
-          esac
-
-          if [ -z "$ROLE_ARN" ]; then
-            echo "ERROR: Missing AWS_ROLE_ARN repo secret."
-            exit 1
-          fi
-
-          if [ -z "$REGION" ]; then
-            echo "ERROR: Missing AWS region for environment: $INPUT_ENVIRONMENT"
-            echo "       Check repo secret AWS_REGION_DEV / AWS_REGION_STAGING / AWS_REGION_PROD."
-            exit 1
-          fi
-
-          {
-            echo "AWS_ROLE_ARN=$ROLE_ARN"
-            echo "AWS_REGION=$REGION"
-          } >> "$GITHUB_ENV"
-
-          echo "Credentials resolved (not yet assumed):"
-          echo "  Environment : $INPUT_ENVIRONMENT"
-          echo "  Region      : $REGION"
-          echo "  Role        : $ROLE_ARN"
-
-      # ========================================================
-      # Deployment information
-      # ========================================================
-
-      - name: Deployment information
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=============================================="
-          echo "AWS Lambda Functions - $INPUT_ENVIRONMENT"
-          echo "=============================================="
-          echo "Branch       : $BRANCH_NAME"
-          echo "Commit       : $COMMIT_SHA"
-          echo "Region       : $AWS_REGION"
-          echo "Role         : $AWS_ROLE_ARN"
-          echo "Manual input : ${INPUT_FUNCTIONS:-<none>}"
-          echo "Base input   : ${INPUT_BASE:-<auto>}"
-          echo "=============================================="
+      
 
       # ========================================================
       # Setup Python
@@ -585,6 +498,96 @@ jobs:
 
           echo "has_changes=true" >> "$GITHUB_OUTPUT"
           echo "source=diff" >> "$GITHUB_OUTPUT"
+
+
+      # ========================================================
+      # Resolve environment-specific credentials
+      #
+      # Switch on INPUT_ENVIRONMENT to pick the right region.
+      # The AWS role ARN is shared between environments (OIDC).
+      #
+      # ⚠️ This step ONLY reads secrets and exports env vars.
+      # It does NOT call AWS. No OIDC token is exchanged yet.
+      #
+      # Exports:
+      #   AWS_ROLE_ARN  (shared)
+      #   AWS_REGION    (env-specific)
+      # to $GITHUB_ENV for later steps.
+      # ========================================================
+
+      - name: Resolve environment credentials
+        shell: bash
+        env:
+          SECRET_AWS_ROLE_ARN:       ${{ secrets.AWS_ROLE_ARN }}
+          SECRET_AWS_REGION_DEV:     ${{ secrets.AWS_REGION_DEV }}
+          SECRET_AWS_REGION_STAGING: ${{ secrets.AWS_REGION_STAGING }}
+          SECRET_AWS_REGION_PROD:    ${{ secrets.AWS_REGION_PROD }}
+        run: |
+          set -euo pipefail
+
+          echo "=============================================="
+          echo "Resolving credentials for: $INPUT_ENVIRONMENT"
+          echo "=============================================="
+
+          case "$INPUT_ENVIRONMENT" in
+            dev)
+              ROLE_ARN="$SECRET_AWS_ROLE_ARN"
+              REGION="$SECRET_AWS_REGION_DEV"
+              ;;
+            staging)
+              ROLE_ARN="$SECRET_AWS_ROLE_ARN"
+              REGION="$SECRET_AWS_REGION_STAGING"
+              ;;
+            prod)
+              ROLE_ARN="$SECRET_AWS_ROLE_ARN"
+              REGION="$SECRET_AWS_REGION_PROD"
+              ;;
+            *)
+              echo "ERROR: Unsupported environment: $INPUT_ENVIRONMENT"
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$ROLE_ARN" ]; then
+            echo "ERROR: Missing AWS_ROLE_ARN repo secret."
+            exit 1
+          fi
+
+          if [ -z "$REGION" ]; then
+            echo "ERROR: Missing AWS region for environment: $INPUT_ENVIRONMENT"
+            echo "       Check repo secret AWS_REGION_DEV / AWS_REGION_STAGING / AWS_REGION_PROD."
+            exit 1
+          fi
+
+          {
+            echo "AWS_ROLE_ARN=$ROLE_ARN"
+            echo "AWS_REGION=$REGION"
+          } >> "$GITHUB_ENV"
+
+          echo "Credentials resolved (not yet assumed):"
+          echo "  Environment : $INPUT_ENVIRONMENT"
+          echo "  Region      : $REGION"
+          echo "  Role        : $ROLE_ARN"
+
+      # ========================================================
+      # Deployment information
+      # ========================================================
+
+      - name: Deployment information
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=============================================="
+          echo "AWS Lambda Functions - $INPUT_ENVIRONMENT"
+          echo "=============================================="
+          echo "Branch       : $BRANCH_NAME"
+          echo "Commit       : $COMMIT_SHA"
+          echo "Region       : $AWS_REGION"
+          echo "Role         : $AWS_ROLE_ARN"
+          echo "Manual input : ${INPUT_FUNCTIONS:-<none>}"
+          echo "Base input   : ${INPUT_BASE:-<auto>}"
+          echo "=============================================="
 
       # ========================================================
       # Configure AWS credentials (OIDC) — ONLY IF CHANGES EXIST
