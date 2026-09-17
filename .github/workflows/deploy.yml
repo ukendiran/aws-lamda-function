@@ -8,15 +8,14 @@
 #   - Detect ANY file change inside a Lambda folder
 #   - Allow explicit function override
 #   - Allow explicit base ref/SHA
-#   - Detect common/ and workflow changes (force manual selection)
 #   - Generate an accurate deployment summary
 #
 # Flow (in order):
 #   1. Checkout
 #   2. Setup gh CLI
 #   3. Set up Python
-#   4. Resolve comparison base        (git-only)
-#   5. Detect changed functions       (git-only)
+#   4. Resolve comparison base         (git-only)
+#   5. Detect changed functions        (git-only)
 #   6. Resolve environment credentials (reads secrets, no AWS call)
 #   7. ONLY IF changes exist:
 #        - Configure AWS credentials (OIDC)   ← first AWS call
@@ -248,8 +247,8 @@ jobs:
       # 5. Detect changed functions  (git-only — no AWS)
       #
       # Detects ANY file change inside a Lambda folder.
-      # A folder is considered a Lambda if it contains
-      # lambda_function.py at its top level.
+      # A folder is a Lambda if it contains lambda_function.py
+      # at its top level.
       # ========================================================
 
       - name: Detect changed functions
@@ -363,61 +362,11 @@ jobs:
           echo "----------------------------------------------"
 
           # ------------------------------------------------------
-          # 5.3 Detect shared code changes
-          #
-          # common/ and _shared/ live OUTSIDE any Lambda folder
-          # and can affect MANY functions. Refuse to auto-guess.
-          # ------------------------------------------------------
-
-          if printf '%s\n' "$CHANGED_FILES" |
-            grep -qE '^common/|^_shared/'; then
-
-            echo ""
-            echo "=============================================="
-            echo "Manual function selection required"
-            echo "=============================================="
-            echo ""
-            echo "Shared code changes detected (common/ or _shared/)."
-            echo ""
-            echo "Shared code may affect multiple functions."
-            echo "Please re-run the workflow with:"
-            echo ""
-            echo "functions: HelloWorld,S3ListBuckets,DynamoDbWriter"
-            echo ""
-            exit 1
-          fi
-
-          # ------------------------------------------------------
-          # 5.4 Detect workflow/config changes
-          #
-          # Changes to the workflow or its config can alter the
-          # deploy behaviour. Refuse to auto-guess.
-          # ------------------------------------------------------
-
-          if printf '%s\n' "$CHANGED_FILES" |
-            grep -qE '^\.github/'; then
-
-            echo ""
-            echo "=============================================="
-            echo "Manual function selection required"
-            echo "=============================================="
-            echo ""
-            echo "GitHub workflow/config changes detected."
-            echo ""
-            echo "Please re-run the workflow with:"
-            echo ""
-            echo "functions: HelloWorld,S3ListBuckets,DynamoDbWriter"
-            echo ""
-            exit 1
-          fi
-
-          # ------------------------------------------------------
-          # 5.5 Detect ALL changed files inside Lambda folders
+          # 5.3 Detect ALL changed files inside Lambda folders
           #
           # A top-level folder is a Lambda if it contains
           # lambda_function.py. ANY changed file inside such a
-          # folder triggers deployment of that Lambda — no
-          # extension filtering.
+          # folder triggers deployment of that Lambda.
           # ------------------------------------------------------
 
           FUNCTIONS=""
@@ -440,11 +389,6 @@ jobs:
                 continue
                 ;;
             esac
-
-            # Skip known non-Lambda top-level folders
-            if [ "$FUNCTION" = "common" ] || [ "$FUNCTION" = "_shared" ]; then
-              continue
-            fi
 
             # Only treat as Lambda if the folder has lambda_function.py
             if [ ! -f "$FUNCTION/lambda_function.py" ]; then
@@ -487,7 +431,7 @@ jobs:
           echo "----------------------------------------------"
 
           # ------------------------------------------------------
-          # 5.6 No function changes
+          # 5.4 No function changes
           # ------------------------------------------------------
 
           if [ -z "$FUNCTIONS" ]; then
