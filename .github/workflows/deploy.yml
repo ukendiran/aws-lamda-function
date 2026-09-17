@@ -5,21 +5,24 @@
 #   - Manual deployment only
 #   - Choose environment (dev | staging | prod) via workflow_dispatch
 #   - Deploy only affected Lambda functions
-#   - File-level change detection inside function folders
-#   - Skip non-deployable files (*.md, .gitignore, etc.)
+#   - Detect ANY file change inside a Lambda folder
 #   - Allow explicit function override
 #   - Allow explicit base ref/SHA
-#   - Detect common/ and workflow changes
+#   - Detect common/ and workflow changes (force manual selection)
 #   - Generate an accurate deployment summary
 #
-# Flow:
-#   1. Resolve credentials (reads secrets — no AWS call)
-#   2. Set up Python
-#   3. Resolve base
-#   4. Detect changes (git-only — no AWS call)
-#   5. ONLY IF there are changes: configure AWS (OIDC) + verify
-#   6. Deploy
-#   7. Summary
+# Flow (in order):
+#   1. Checkout
+#   2. Setup gh CLI
+#   3. Set up Python
+#   4. Resolve comparison base        (git-only)
+#   5. Detect changed functions       (git-only)
+#   6. Resolve environment credentials (reads secrets, no AWS call)
+#   7. ONLY IF changes exist:
+#        - Configure AWS credentials (OIDC)   ← first AWS call
+#        - Verify AWS identity
+#        - Deploy functions
+#   8. Summary (always)
 #
 # Important:
 #   - Does NOT use GitHub Environments.
@@ -37,7 +40,11 @@
 #   <FunctionName>/
 #     lambda_function.py     (discovery marker)
 #     requirements.txt       (optional)
-#     ...other source files
+#     ...any other files
+#
+# A top-level folder is treated as a Lambda function ONLY IF it
+# contains lambda_function.py. ANY changed file inside such a
+# folder triggers deployment of that function.
 # ============================================================
 
 name: Deploy Lambda Functions
@@ -95,7 +102,7 @@ jobs:
 
     steps:
       # ========================================================
-      # Checkout
+      # 1. Checkout
       # ========================================================
 
       - name: Checkout selected branch
@@ -105,7 +112,7 @@ jobs:
           fetch-depth: 0
 
       # ========================================================
-      # Setup GitHub CLI (used for base resolution)
+      # 2. Setup GitHub CLI (used for base resolution)
       # ========================================================
 
       - name: Setup GitHub CLI
@@ -114,10 +121,8 @@ jobs:
           set -euo pipefail
           gh --version
 
-      
-
       # ========================================================
-      # Setup Python
+      # 3. Setup Python
       # ========================================================
 
       - name: Set up Python
@@ -126,7 +131,7 @@ jobs:
           python-version: "3.12"
 
       # ========================================================
-      # Resolve comparison base  (git-only — no AWS)
+      # 4. Resolve comparison base  (git-only — no AWS)
       # ========================================================
 
       - name: Resolve comparison base
@@ -145,7 +150,7 @@ jobs:
           BASE=""
 
           # ------------------------------------------------------
-          # 1. Manual base supplied
+          # 4.1 Manual base supplied
           # ------------------------------------------------------
 
           if [ -n "$INPUT_BASE" ]; then
@@ -165,7 +170,7 @@ jobs:
 
           else
             # ----------------------------------------------------
-            # 2. Last successful deployment for THIS environment
+            # 4.2 Last successful deployment for THIS environment
             # ----------------------------------------------------
 
             echo "No base supplied."
@@ -221,7 +226,7 @@ jobs:
           fi
 
           # ------------------------------------------------------
-          # Final validation
+          # 4.3 Final validation
           # ------------------------------------------------------
 
           if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
@@ -240,7 +245,11 @@ jobs:
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
       # ========================================================
-      # Detect changed functions  (git-only — no AWS)
+      # 5. Detect changed functions  (git-only — no AWS)
+      #
+      # Detects ANY file change inside a Lambda folder.
+      # A folder is considered a Lambda if it contains
+      # lambda_function.py at its top level.
       # ========================================================
 
       - name: Detect changed functions
@@ -252,11 +261,11 @@ jobs:
           set -euo pipefail
 
           echo "=============================================="
-          echo "Detecting changed functions (file-level)"
+          echo "Detecting changed functions"
           echo "=============================================="
 
           # ------------------------------------------------------
-          # Explicit function input
+          # 5.1 Explicit function input
           # ------------------------------------------------------
 
           if [ -n "$INPUT_FUNCTIONS" ]; then
@@ -318,7 +327,7 @@ jobs:
           fi
 
           # ------------------------------------------------------
-          # Automatic change detection
+          # 5.2 Automatic change detection
           # ------------------------------------------------------
 
           if [ -z "$BASE_SHA" ]; then
@@ -354,7 +363,10 @@ jobs:
           echo "----------------------------------------------"
 
           # ------------------------------------------------------
-          # Detect shared code changes
+          # 5.3 Detect shared code changes
+          #
+          # common/ and _shared/ live OUTSIDE any Lambda folder
+          # and can affect MANY functions. Refuse to auto-guess.
           # ------------------------------------------------------
 
           if printf '%s\n' "$CHANGED_FILES" |
@@ -376,7 +388,10 @@ jobs:
           fi
 
           # ------------------------------------------------------
-          # Detect workflow/config changes
+          # 5.4 Detect workflow/config changes
+          #
+          # Changes to the workflow or its config can alter the
+          # deploy behaviour. Refuse to auto-guess.
           # ------------------------------------------------------
 
           if printf '%s\n' "$CHANGED_FILES" |
@@ -397,11 +412,13 @@ jobs:
           fi
 
           # ------------------------------------------------------
-          # Detect actual function directories only
-          # with a deployable-file filter
+          # 5.5 Detect ALL changed files inside Lambda folders
+          #
+          # A top-level folder is a Lambda if it contains
+          # lambda_function.py. ANY changed file inside such a
+          # folder triggers deployment of that Lambda — no
+          # extension filtering.
           # ------------------------------------------------------
-
-          DEPLOYABLE='(\.py|\.json|\.yaml|\.yml|\.toml|\.cfg|\.ini)$|^[^/]+/requirements\.txt$'
 
           FUNCTIONS=""
           FILE_ROWS=""
@@ -409,27 +426,34 @@ jobs:
           while IFS=$'\t' read -r STATUS FILE; do
             [ -z "$FILE" ] && continue
 
+            # Strip CR characters (Windows runners may inject them)
+            FILE="$(printf '%s' "$FILE" | tr -d '\r')"
+            STATUS="$(printf '%s' "$STATUS" | tr -d '\r')"
+
+            # Only files under a top-level folder
             case "$FILE" in
               */*)
                 FUNCTION="$(printf '%s' "$FILE" | cut -d '/' -f 1)"
-
-                if [ "$FUNCTION" = "common" ] || [ "$FUNCTION" = "_shared" ]; then
-                  continue
-                fi
-
-                if [ ! -f "$FUNCTION/lambda_function.py" ]; then
-                  continue
-                fi
-
-                if ! printf '%s' "$FILE" | grep -qE "$DEPLOYABLE"; then
-                  echo "Skipping non-deployable: $FILE"
-                  continue
-                fi
-
-                FUNCTIONS="${FUNCTIONS}${FUNCTION}"$'\n'
-                FILE_ROWS="${FILE_ROWS}${FUNCTION}"$'\t'"${STATUS}"$'\t'"${FILE}"$'\n'
+                ;;
+              *)
+                # File at repo root — ignore (README.md, .gitignore, etc.)
+                continue
                 ;;
             esac
+
+            # Skip known non-Lambda top-level folders
+            if [ "$FUNCTION" = "common" ] || [ "$FUNCTION" = "_shared" ]; then
+              continue
+            fi
+
+            # Only treat as Lambda if the folder has lambda_function.py
+            if [ ! -f "$FUNCTION/lambda_function.py" ]; then
+              continue
+            fi
+
+            # Any file inside the Lambda folder counts
+            FUNCTIONS="${FUNCTIONS}${FUNCTION}"$'\n'
+            FILE_ROWS="${FILE_ROWS}${FUNCTION}"$'\t'"${STATUS}"$'\t'"${FILE}"$'\n'
           done < <(git diff --name-status "$BASE_SHA...HEAD")
 
           FUNCTIONS="$(
@@ -451,7 +475,7 @@ jobs:
           echo "----------------------------------------------"
 
           echo ""
-          echo "Changed deployable files:"
+          echo "Changed files inside Lambda folders:"
           echo "----------------------------------------------"
 
           if [ -n "$FILE_ROWS" ]; then
@@ -463,7 +487,7 @@ jobs:
           echo "----------------------------------------------"
 
           # ------------------------------------------------------
-          # No function changes
+          # 5.6 No function changes
           # ------------------------------------------------------
 
           if [ -z "$FUNCTIONS" ]; then
@@ -499,9 +523,8 @@ jobs:
           echo "has_changes=true" >> "$GITHUB_OUTPUT"
           echo "source=diff" >> "$GITHUB_OUTPUT"
 
-
       # ========================================================
-      # Resolve environment-specific credentials
+      # 6. Resolve environment-specific credentials
       #
       # Switch on INPUT_ENVIRONMENT to pick the right region.
       # The AWS role ARN is shared between environments (OIDC).
@@ -570,7 +593,7 @@ jobs:
           echo "  Role        : $ROLE_ARN"
 
       # ========================================================
-      # Deployment information
+      # 6b. Deployment information
       # ========================================================
 
       - name: Deployment information
@@ -587,16 +610,17 @@ jobs:
           echo "Role         : $AWS_ROLE_ARN"
           echo "Manual input : ${INPUT_FUNCTIONS:-<none>}"
           echo "Base input   : ${INPUT_BASE:-<auto>}"
+          echo "Has changes  : ${{ steps.changes.outputs.has_changes }}"
           echo "=============================================="
 
       # ========================================================
-      # Configure AWS credentials (OIDC) — ONLY IF CHANGES EXIST
+      # 7. Configure AWS credentials (OIDC) — ONLY IF CHANGES EXIST
       #
       # This is the first step that actually talks to AWS.
-      # Runs only when has_changes == 'true'.
       # ========================================================
 
       - name: Configure AWS credentials (OIDC)
+        id: configure-aws
         if: steps.changes.outputs.has_changes == 'true'
         uses: aws-actions/configure-aws-credentials@v5
         with:
@@ -604,10 +628,11 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       # ========================================================
-      # Verify AWS identity — ONLY IF CHANGES EXIST
+      # 7b. Verify AWS identity — ONLY IF CHANGES EXIST
       # ========================================================
 
       - name: Verify AWS identity
+        id: verify-aws
         if: steps.changes.outputs.has_changes == 'true'
         shell: powershell
         run: |
@@ -622,7 +647,7 @@ jobs:
           }
 
       # ========================================================
-      # Deploy functions
+      # 7c. Deploy functions — ONLY IF CHANGES EXIST
       # ========================================================
 
       - name: Deploy functions
@@ -731,25 +756,25 @@ jobs:
           }
 
       # ========================================================
-      # Deployment summary
+      # 8. Deployment summary (always)
       # ========================================================
 
       - name: Generate deployment summary
         if: always()
         shell: bash
         env:
-          FUNCTIONS:        ${{ steps.changes.outputs.functions }}
-          CHANGED_FILES:    ${{ steps.changes.outputs.changed_files }}
-          DEPLOYED:         ${{ steps.deploy.outputs.deployed }}
-          FAILED:           ${{ steps.deploy.outputs.failed }}
-          HAS_CHANGES:      ${{ steps.changes.outputs.has_changes }}
-          CHANGE_SOURCE:    ${{ steps.changes.outputs.source }}
-          BASE_SHA:         ${{ steps.base.outputs.base }}
-          BASE_OUTCOME:     ${{ steps.base.outcome }}
-          CHANGES_OUTCOME:  ${{ steps.changes.outcome }}
-          AWS_CONFIGURE_OUTCOME: ${{ steps.configure-aws.outcome }}
-          AWS_VERIFY_OUTCOME:    ${{ steps.verify-aws.outcome }}
-          DEPLOY_OUTCOME:   ${{ steps.deploy.outcome }}
+          FUNCTIONS:              ${{ steps.changes.outputs.functions }}
+          CHANGED_FILES:          ${{ steps.changes.outputs.changed_files }}
+          DEPLOYED:               ${{ steps.deploy.outputs.deployed }}
+          FAILED:                 ${{ steps.deploy.outputs.failed }}
+          HAS_CHANGES:            ${{ steps.changes.outputs.has_changes }}
+          CHANGE_SOURCE:          ${{ steps.changes.outputs.source }}
+          BASE_SHA:               ${{ steps.base.outputs.base }}
+          BASE_OUTCOME:           ${{ steps.base.outcome }}
+          CHANGES_OUTCOME:        ${{ steps.changes.outcome }}
+          AWS_CONFIGURE_OUTCOME:  ${{ steps.configure-aws.outcome }}
+          AWS_VERIFY_OUTCOME:     ${{ steps.verify-aws.outcome }}
+          DEPLOY_OUTCOME:         ${{ steps.deploy.outcome }}
         run: |
           set -u
 
