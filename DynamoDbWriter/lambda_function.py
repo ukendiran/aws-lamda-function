@@ -64,5 +64,4 @@ def _bad_request(msg):
         "statusCode": 400,
         "body": json.dumps({"error": msg}),
     }
-
     
