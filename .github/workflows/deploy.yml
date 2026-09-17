@@ -508,7 +508,7 @@ jobs:
           echo "---"
           echo ""
           echo "Workflow: \`$GITHUB_WORKFLOW\`"
-          echo "Run: \`$GITHUB_RUN_ID\`
+          echo "Run: \`$GITHUB_RUN_ID\`"
 
       # # ========================================================
       # # 6. Resolve environment-specific credentials
