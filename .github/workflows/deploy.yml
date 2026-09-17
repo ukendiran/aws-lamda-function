@@ -15,7 +15,7 @@
 #   1. Checkout
 #   2. Setup gh CLI
 #   3. Set up Python
-#   4. Resolve comparison base         (git-only)
+#   4. Resolve comparison base         (git-only, env-scoped)
 #   5. Detect changed functions        (git-only)
 #   6. Resolve environment credentials (reads secrets, no AWS call)
 #   7. ONLY IF changes exist:
@@ -27,9 +27,15 @@
 #
 # Base resolution:
 #   - If `base` input is provided -> use it (validated).
-#   - Otherwise -> last successful run of this workflow on the
-#     same branch, filtered to the same environment.
+#   - Otherwise -> last successful run of this workflow whose
+#     displayTitle ends with "(<environment>)".
+#     NOT scoped by branch — any branch is acceptable.
 #   - If neither is available -> fail with a clear message.
+#
+# ⚠️ IMPORTANT: The job name contains "(${{ inputs.environment }})".
+#     The base-resolution step depends on this suffix existing in
+#     the run's displayTitle. DO NOT RENAME THE JOB without also
+#     updating the base-resolution step.
 #
 # Lambda name resolution (in order):
 #   1. <folder>/deploy.config.json -> .name.<environment>
@@ -82,7 +88,7 @@ on:
         description: >-
           Optional base ref/SHA for change detection.
           Leave empty to use the last successful deployment of this
-          workflow on the selected branch and environment.
+          workflow for the selected environment (any branch).
         required: false
         type: string
         default: ""
@@ -94,9 +100,13 @@ permissions:
 
 jobs:
   deploy:
-    # ⚠️ DO NOT rename this job. The base-resolution step relies on
-    # the "(<environment>)" suffix appearing in the run's displayTitle.
-    name: Detect and Deploy Lambda Functions (${{ inputs.environment }})
+    # ────────────────────────────────────────────────────────────
+    # ⚠️ The "(<env>)" suffix in this name is REQUIRED by the
+    #    "Resolve comparison base" step, which filters prior runs
+    #    by displayTitle ending with "(dev)" / "(staging)" / "(prod)".
+    #    Do NOT rename without updating that step.
+    # ────────────────────────────────────────────────────────────
+    name: Deploy (${{ inputs.environment }})
     runs-on: windows-latest
 
     # ⚠️ IMPORTANT: No `environment:` key here.
@@ -145,12 +155,11 @@ jobs:
       #
       # Priority:
       #   1. Explicit `base` input (validated).
-      #   2. Last successful run of this workflow for the SAME
-      #      ENVIRONMENT (matched on the "(env)" suffix in
-      #      displayTitle) — across ALL branches.
+      #   2. Last successful run whose displayTitle ends with
+      #      "(<environment>)". NOT scoped by branch.
       #   3. Fail with a clear message.
       #
-      # This step is SKIPPED when `functions` is provided.
+      # Skipped when `functions` is provided.
       # ========================================================
 
       - name: Resolve comparison base
@@ -190,49 +199,49 @@ jobs:
           else
             # ----------------------------------------------------
             # 4.2 Last successful deployment for THIS environment
-            #     (environment-scoped, all branches)
+            #     (env-scoped, any branch)
             # ----------------------------------------------------
 
             echo "No base supplied."
             echo "Finding the last successful deployment for environment:"
             echo "  $INPUT_ENVIRONMENT"
-            echo "Workflow: $GITHUB_WORKFLOW"
-            echo "Scope   : all branches"
-
-            # Debug: show recent successful runs so we can see what's there
+            echo "Workflow : $GITHUB_WORKFLOW"
+            echo "Job name : Deploy ($INPUT_ENVIRONMENT)"
+            echo "Scope    : all branches"
             echo ""
+
+            # Debug: show recent successful runs so we can see what exists
             echo "--- Recent successful runs (any branch) ---"
             gh run list \
               --workflow "$GITHUB_WORKFLOW" \
               --status success \
               --json headSha,displayTitle,headBranch,createdAt \
-              --limit 10 \
+              --limit 15 \
               --jq '.[] | "\(.createdAt)  \(.headBranch)  \(.displayTitle)  \(.headSha)"' \
               || echo "(no runs found)"
             echo "-------------------------------------------"
             echo ""
 
-            # Match runs whose displayTitle contains "(<env>)"
-            # e.g. "Detect and Deploy Lambda Functions (dev)"
+            # Match runs whose displayTitle ends with "(<env>)"
+            # e.g. "Deploy (dev)" / "Deploy (staging)" / "Deploy (prod)"
             LAST_SUCCESS_SHA="$(
               gh run list \
                 --workflow "$GITHUB_WORKFLOW" \
                 --status success \
-                --json headSha,displayTitle,createdAt \
+                --json headSha,displayTitle \
                 --limit 100 \
-                --jq ".[] | select(.displayTitle | contains(\"($INPUT_ENVIRONMENT)\")) | .headSha" \
+                --jq ".[] | select(.displayTitle | endswith(\"($INPUT_ENVIRONMENT)\")) | .headSha" \
                 | head -n1
             )"
 
             if [ -n "$LAST_SUCCESS_SHA" ]; then
               BASE="$LAST_SUCCESS_SHA"
 
-              echo ""
               echo "Last successful $INPUT_ENVIRONMENT deployment found:"
-              echo "$BASE"
+              echo "  $BASE"
+              echo ""
 
               if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
-                echo ""
                 echo "Fetching missing base commit..."
                 git fetch origin "$BASE"
 
@@ -247,6 +256,8 @@ jobs:
             else
               echo ""
               echo "ERROR: Could not find a previous successful $INPUT_ENVIRONMENT deployment."
+              echo ""
+              echo "No successful run with displayTitle ending in '($INPUT_ENVIRONMENT)' was found."
               echo ""
               echo "This is expected for the first deployment of this environment."
               echo ""
@@ -397,10 +408,6 @@ jobs:
 
           # ------------------------------------------------------
           # 5.3 Detect ALL changed files inside Lambda folders
-          #
-          # A top-level folder is a Lambda if it contains
-          # lambda_function.py. ANY changed file inside such a
-          # folder triggers deployment of that Lambda.
           # ------------------------------------------------------
 
           FUNCTIONS=""
@@ -409,27 +416,23 @@ jobs:
           while IFS=$'\t' read -r STATUS FILE; do
             [ -z "$FILE" ] && continue
 
-            # Strip CR characters (Windows runners may inject them)
             FILE="$(printf '%s' "$FILE" | tr -d '\r')"
             STATUS="$(printf '%s' "$STATUS" | tr -d '\r')"
 
-            # Only files under a top-level folder
             case "$FILE" in
               */*)
                 FUNCTION="$(printf '%s' "$FILE" | cut -d '/' -f 1)"
                 ;;
               *)
-                # File at repo root — ignore (README.md, .gitignore, etc.)
+                # File at repo root — ignore
                 continue
                 ;;
             esac
 
-            # Only treat as Lambda if the folder has lambda_function.py
             if [ ! -f "$FUNCTION/lambda_function.py" ]; then
               continue
             fi
 
-            # Any file inside the Lambda folder counts
             FUNCTIONS="${FUNCTIONS}${FUNCTION}"$'\n'
             FILE_ROWS="${FILE_ROWS}${FUNCTION}"$'\t'"${STATUS}"$'\t'"${FILE}"$'\n'
           done < <(git diff --name-status "$BASE_SHA...HEAD")
@@ -501,20 +504,17 @@ jobs:
           echo "has_changes=true" >> "$GITHUB_OUTPUT"
           echo "source=diff" >> "$GITHUB_OUTPUT"
 
-            echo ""
-            echo "---"
-            echo ""
-            echo "Workflow: \`$GITHUB_WORKFLOW\`"
-            echo "source=diff" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "---"
+          echo ""
+          echo "Workflow: \`$GITHUB_WORKFLOW\`"
+          echo "Run: \`$GITHUB_RUN_ID\`
 
       # # ========================================================
       # # 6. Resolve environment-specific credentials
       # #
       # # Switch on INPUT_ENVIRONMENT to pick the right region.
-      # # The AWS role ARN is shared between environments (OIDC).
-      # #
-      # # ⚠️ This step ONLY reads secrets and exports env vars.
-      # # It does NOT call AWS. No OIDC token is exchanged yet.
+      # # Reads repo secrets only — no AWS call.
       # # ========================================================
 
       # - name: Resolve environment credentials
@@ -625,13 +625,6 @@ jobs:
 
       # # ========================================================
       # # 7c. Resolve env-specific Lambda names — ONLY IF CHANGES EXIST
-      # #
-      # # For each changed folder:
-      # #   1. If <folder>/deploy.config.json exists -> read .name.<env>
-      # #   2. Otherwise -> "<folder>-<env>"
-      # #   3. Safety: the resolved name MUST contain the env token.
-      # #
-      # # Output: mapping (folder<TAB>lambda-name, one per line)
       # # ========================================================
 
       # - name: Resolve env-specific Lambda names
@@ -665,7 +658,6 @@ jobs:
       #         LAMBDA_NAME="${FUNCTION}-${ENV_NAME}"
       #       fi
 
-      #       # Safety: resolved name MUST contain the env token
       #       if ! printf '%s' "$LAMBDA_NAME" | grep -qi -- "$ENV_NAME"; then
       #         echo ""
       #         echo "ERROR: Resolved Lambda name does not contain env '$ENV_NAME':"
@@ -707,7 +699,6 @@ jobs:
       #     Write-Host "Deploying Functions - $env_name"
       #     Write-Host "=============================================="
 
-      #     # Parse "folder<TAB>lambda-name" pairs
       #     $pairs = @()
       #     foreach ($line in ($env:MAPPING -split "`n")) {
       #       if ($line.Trim() -eq "") { continue }
@@ -744,15 +735,12 @@ jobs:
       #         if (Test-Path $pkgPath)  { Remove-Item $pkgPath  -Force }
       #         New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
 
-      #         # Copy function source
       #         Copy-Item -Path "$function\*" -Destination $buildDir -Recurse -Force
 
-      #         # Strip local-only folders
       #         Get-ChildItem -Path $buildDir -Recurse -Directory -ErrorAction SilentlyContinue |
       #           Where-Object { $_.Name -in @('__pycache__','.venv','venv','.pytest_cache','scripts','.git','tests') } |
       #           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-      #         # Install dependencies if requirements.txt exists
       #         $reqFile = "$function\requirements.txt"
       #         if (Test-Path $reqFile) {
       #           Write-Host "Installing dependencies..." -ForegroundColor Cyan
@@ -766,19 +754,16 @@ jobs:
       #           if ($LASTEXITCODE -ne 0) { throw "pip install failed for $function" }
       #         }
 
-      #         # Zip
       #         Compress-Archive -Path "$buildDir\*" -DestinationPath $pkgPath -Force
       #         $pkgFull = (Resolve-Path $pkgPath).Path
       #         $sizeKB  = [math]::Round((Get-Item $pkgFull).Length / 1KB, 1)
       #         Write-Host ("Package: {0} ({1} KB)" -f $pkgFull, $sizeKB) -ForegroundColor Green
 
-      #         # Ensure function exists
       #         aws lambda get-function --function-name $fnFull --region $region 2>$null | Out-Null
       #         if ($LASTEXITCODE -ne 0) {
       #           throw "Lambda '$fnFull' not found in $region. Create it before deploying."
       #         }
 
-      #         # Upload
       #         aws lambda update-function-code `
       #           --function-name $fnFull `
       #           --zip-file "fileb://$pkgFull" `
@@ -891,10 +876,6 @@ jobs:
 
       #       else
 
-      #         # --------------------------------------------------
-      #         # Changed files per function
-      #         # --------------------------------------------------
-
       #         if [ -n "${CHANGED_FILES:-}" ]; then
       #           echo "## Changed Files"
       #           echo ""
@@ -919,10 +900,6 @@ jobs:
       #           echo ""
       #         fi
 
-      #         # --------------------------------------------------
-      #         # Resolved Lambda names
-      #         # --------------------------------------------------
-
       #         if [ -n "${MAPPING:-}" ]; then
       #           echo "## Resolved Lambda Names"
       #           echo ""
@@ -936,10 +913,6 @@ jobs:
 
       #           echo ""
       #         fi
-
-      #         # --------------------------------------------------
-      #         # AWS authentication status
-      #         # --------------------------------------------------
 
       #         echo "## AWS Authentication"
       #         echo ""
@@ -968,10 +941,6 @@ jobs:
       #         esac
 
       #         echo ""
-
-      #         # --------------------------------------------------
-      #         # Deployment status per function
-      #         # --------------------------------------------------
 
       #         echo "## Functions"
       #         echo ""
@@ -1034,6 +1003,4 @@ jobs:
       #       echo "---"
       #       echo ""
       #       echo "Workflow: \`$GITHUB_WORKFLOW\`"
-      #       echo "Run: \`$GITHUB_RUN_ID\`"
-
-      #     } >> "$GITHUB_STEP
+      #       echo "Run: \`$GITHUB_RUN_ID\`
