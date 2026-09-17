@@ -215,12 +215,12 @@ jobs:
           EXPECTED="${AWS_ROLE_ARN##*/}"
           [[ "$ARN" == *"$EXPECTED"* ]] || { echo "ERROR: unexpected role"; exit 1; }
 
-      --------------------------------------------------------
-      8. Build + deploy each Lambda
-         - Target name = <folder>-<env> (override via
-           <folder>/deploy.config.json -> .name[<env>])
-         - Only updates existing functions
-      --------------------------------------------------------
+      # --------------------------------------------------------
+      # 8. Build + deploy each Lambda
+      #    - Target name = <folder>-<env> (override via
+      #      <folder>/deploy.config.json -> .name[<env>])
+      #    - Only updates existing functions
+      #--------------------------------------------------------
       - name: Deploy functions
         id: deploy
         if: steps.changes.outputs.has_changes == 'true'
@@ -319,7 +319,7 @@ jobs:
             exit 1
           fi
 
-      # --------------------------------------------------------
+      # # --------------------------------------------------------
       # 9. Detailed job summary (always runs)
       # --------------------------------------------------------
       - name: Summary
