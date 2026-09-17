@@ -1,0 +1,488 @@
+# ============================================================
+# Deploy AWS Lambda functions (staging + production)
+# ------------------------------------------------------------
+# - Manual trigger (workflow_dispatch)
+# - OIDC auth (no long-lived AWS keys)
+# - Ubuntu runner, Python 3.12
+# - Deploys only Lambda folders that changed since the last
+#   successful deploy for the selected environment, unless
+#   `functions` is provided.
+# - Any per-function failure fails the job.
+# ============================================================
+
+name: Deploy Lambda Functions
+run-name: Deploy Lambda Functions (${{ inputs.environment }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        type: choice
+        options: [staging, production]
+        default: staging
+
+      functions:
+        description: Optional comma-separated function folders. Skips change detection.
+        required: false
+        type: string
+        default: ""
+
+      base:
+        description: Optional git ref/SHA to diff against. Defaults to last successful run.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+
+    env:
+      ENV_NAME: ${{ inputs.environment }}
+      INPUT_FUNCTIONS: ${{ inputs.functions }}
+      INPUT_BASE: ${{ inputs.base }}
+
+    steps:
+      # --------------------------------------------------------
+      # 1. Checkout full history (needed for diffing)
+      # --------------------------------------------------------
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # --------------------------------------------------------
+      # 2. Python (used to build Lambda packages)
+      # --------------------------------------------------------
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # --------------------------------------------------------
+      # 3. Resolve the comparison base
+      #    a) explicit `base` input, else
+      #    b) last successful run of this workflow for this env
+      # --------------------------------------------------------
+      - name: Resolve base
+        id: base
+        if: inputs.functions == ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$INPUT_BASE" ]; then
+            BASE="$INPUT_BASE"
+            git fetch --all --tags --prune
+          else
+            echo "No base input — looking up last successful run for '$ENV_NAME'"
+            BASE="$(
+              gh run list --workflow "$GITHUB_WORKFLOW" --status success \
+                --json headSha,displayTitle --limit 100 \
+              | jq -r '.[] | [.headSha, .displayTitle] | @tsv' \
+              | grep -iF "($ENV_NAME)" | head -n1 | cut -f1
+            )"
+            if [ -z "$BASE" ]; then
+              echo "ERROR: No previous successful deploy for '$ENV_NAME'."
+              echo "Provide 'functions' or 'base' for the first run."
+              exit 1
+            fi
+            git fetch origin "$BASE" || true
+          fi
+
+          git rev-parse --verify "$BASE^{commit}" >/dev/null
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "Resolved base: $BASE"
+
+      # --------------------------------------------------------
+      # 4. Detect changed Lambda folders
+      #    - explicit list wins
+      #    - otherwise any change inside a folder containing
+      #      lambda_function.py triggers that folder
+      # --------------------------------------------------------
+      - name: Detect functions
+        id: changes
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.base }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$INPUT_FUNCTIONS" ]; then
+            FUNCTIONS="$(
+              printf '%s' "$INPUT_FUNCTIONS" \
+              | tr ',' '\n' | sed 's/^ *//;s/ *$//' | sed '/^$/d' | sort -u
+            )"
+            for FN in $FUNCTIONS; do
+              [ -f "$FN/lambda_function.py" ] || { echo "ERROR: missing $FN/lambda_function.py"; exit 1; }
+            done
+            SOURCE="manual"
+          else
+            [ -n "$BASE_SHA" ] || { echo "ERROR: no base resolved"; exit 1; }
+
+            FUNCTIONS="$(
+              git diff --name-only "$BASE_SHA...HEAD" \
+              | awk -F/ 'NF>1 {print $1}' \
+              | sort -u \
+              | while read -r d; do
+                  [ -f "$d/lambda_function.py" ] && echo "$d"
+                done
+            )"
+            SOURCE="diff"
+          fi
+
+          if [ -z "$FUNCTIONS" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+            echo "No Lambda changes detected."
+            exit 0
+          fi
+
+          echo "$FUNCTIONS"
+          {
+            echo "functions<<EOF"
+            echo "$FUNCTIONS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------------
+      # 5. Per-env credentials (same role, different region)
+      # --------------------------------------------------------
+      - name: Resolve credentials
+        shell: bash
+        env:
+          ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          REGION_STAGING: ${{ secrets.AWS_REGION_STAGING }}
+          REGION_PROD: ${{ secrets.AWS_REGION_PROD }}
+        run: |
+          set -euo pipefail
+          case "$ENV_NAME" in
+            staging)    REGION="$REGION_STAGING" ;;
+            production) REGION="$REGION_PROD"    ;;
+            *) echo "ERROR: unknown env '$ENV_NAME'"; exit 1 ;;
+          esac
+          [ -n "$ROLE_ARN" ] || { echo "ERROR: AWS_ROLE_ARN secret not set"; exit 1; }
+          [ -n "$REGION"   ] || { echo "ERROR: region secret not set for $ENV_NAME"; exit 1; }
+          {
+            echo "AWS_ROLE_ARN=$ROLE_ARN"
+            echo "AWS_REGION=$REGION"
+          } >> "$GITHUB_ENV"
+          echo "Region: $REGION"
+
+      # --------------------------------------------------------
+      # 6. Assume role via OIDC
+      # --------------------------------------------------------
+      - name: Configure AWS credentials
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # --------------------------------------------------------
+      # 7. Verify the assumed identity
+      # --------------------------------------------------------
+      - name: Verify AWS identity
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARN="$(aws sts get-caller-identity --query Arn --output text)"
+          echo "Assumed: $ARN"
+          EXPECTED="${AWS_ROLE_ARN##*/}"
+          [[ "$ARN" == *"$EXPECTED"* ]] || { echo "ERROR: unexpected role"; exit 1; }
+
+      # --------------------------------------------------------
+      # 8. Build + deploy each Lambda
+      #    - Target name = <folder>-<env> (override via
+      #      <folder>/deploy.config.json -> .name[<env>])
+      #    - Only updates existing functions
+      # --------------------------------------------------------
+      - name: Deploy functions
+        id: deploy
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          FUNCTIONS: ${{ steps.changes.outputs.functions }}
+        run: |
+          # No `set -e`: try every function, fail at the end.
+          set -uo pipefail
+
+          DEPLOYED=""
+          FAILED=""
+
+          while read -r FN; do
+            [ -z "$FN" ] && continue
+
+            CFG="$FN/deploy.config.json"
+            if [ -f "$CFG" ]; then
+              LAMBDA="$(jq -r --arg e "$ENV_NAME" --arg f "$FN" \
+                '.name[$e] // "\($f)-\($e)"' "$CFG")"
+            else
+              LAMBDA="${FN}-${ENV_NAME}"
+            fi
+
+            echo "::group::Deploy $FN -> $LAMBDA"
+
+            BUILD="build/$FN"
+            ZIP="build/$FN-$ENV_NAME.zip"
+            rm -rf "$BUILD" "$ZIP"
+            mkdir -p "$BUILD"
+            cp -R "$FN"/. "$BUILD"/
+
+            find "$BUILD" -type d \
+              \( -name '__pycache__' -o -name '.venv' -o -name 'venv' \
+              -o -name '.pytest_cache' -o -name '.git' -o -name 'tests' \) \
+              -prune -exec rm -rf {} + 2>/dev/null || true
+
+            if [ -f "$FN/requirements.txt" ]; then
+              python -m pip install --upgrade pip >/dev/null
+              if ! python -m pip install -r "$FN/requirements.txt" -t "$BUILD" \
+                    --platform manylinux2014_x86_64 \
+                    --only-binary=:all: \
+                    --implementation cp \
+                    --python-version 3.12 \
+                    --upgrade; then
+                echo "FAILED: pip install"
+                FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
+                echo "::endgroup::"
+                continue
+              fi
+            fi
+
+            (cd "$BUILD" && zip -qr "../$(basename "$ZIP")" .)
+            ZIP_FULL="$(realpath "$ZIP")"
+
+            if ! aws lambda get-function --function-name "$LAMBDA" \
+                  --region "$AWS_REGION" >/dev/null 2>&1; then
+              echo "FAILED: '$LAMBDA' not found in $AWS_REGION"
+              FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
+              echo "::endgroup::"
+              continue
+            fi
+
+            if ! aws lambda update-function-code \
+                  --function-name "$LAMBDA" \
+                  --zip-file "fileb://$ZIP_FULL" \
+                  --region "$AWS_REGION" >/dev/null \
+              || ! aws lambda wait function-updated \
+                    --function-name "$LAMBDA" \
+                    --region "$AWS_REGION"; then
+              echo "FAILED: update for $LAMBDA"
+              FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "OK: $FN -> $LAMBDA"
+            DEPLOYED="${DEPLOYED}${FN} -> ${LAMBDA}"$'\n'
+            echo "::endgroup::"
+          done <<< "$FUNCTIONS"
+
+          DEPLOYED="${DEPLOYED%$'\n'}"
+          FAILED="${FAILED%$'\n'}"
+
+          {
+            echo "deployed<<EOF"
+            echo "$DEPLOYED"
+            echo "EOF"
+            echo "failed<<EOF"
+            echo "$FAILED"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$FAILED" ]; then
+            echo "One or more functions failed."
+            exit 1
+          fi
+
+           # --------------------------------------------------------
+      # 9. Detailed job summary (always runs)
+      # --------------------------------------------------------
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          # Step outputs
+          FUNCTIONS: ${{ steps.changes.outputs.functions }}
+          CHANGED_FILES: ${{ steps.changes.outputs.changed_files }}
+          DEPLOYED: ${{ steps.deploy.outputs.deployed }}
+          FAILED: ${{ steps.deploy.outputs.failed }}
+          HAS_CHANGES: ${{ steps.changes.outputs.has_changes }}
+          CHANGE_SOURCE: ${{ steps.changes.outputs.source }}
+          BASE_SHA: ${{ steps.base.outputs.base }}
+
+          # Step outcomes (success / failure / skipped / cancelled)
+          BASE_OUTCOME: ${{ steps.base.outcome }}
+          CHANGES_OUTCOME: ${{ steps.changes.outcome }}
+          CONFIGURE_OUTCOME: ${{ steps.configure-aws.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify-aws.outcome }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+        run: |
+          set -u
+
+          case "$ENV_NAME" in
+            production) EMOJI="🚀"; LABEL="Production" ;;
+            staging)    EMOJI="🧪"; LABEL="Staging" ;;
+            *)          EMOJI="⚙️"; LABEL="Unknown" ;;
+          esac
+
+          # Helper: pretty status for an "outcome" value
+          status() {
+            case "$1" in
+              success)   echo "✅ success" ;;
+              failure)   echo "❌ failure" ;;
+              skipped)   echo "⏭️ skipped" ;;
+              cancelled) echo "🛑 cancelled" ;;
+              "")        echo "➖ not run" ;;
+              *)         echo "❔ $1" ;;
+            esac
+          }
+
+          # Helper: pretty git-status letter
+          gitstatus() {
+            case "$1" in
+              A*) echo "🆕 Added" ;;
+              M*) echo "✏️ Modified" ;;
+              D*) echo "🗑️ Deleted" ;;
+              R*) echo "🔀 Renamed" ;;
+              C*) echo "📄 Copied" ;;
+              *)  echo "$1" ;;
+            esac
+          }
+
+          {
+            echo "# ${EMOJI} Lambda Functions — ${LABEL}"
+            echo ""
+
+            # ---------------- Context table ----------------
+            echo "## Deployment Context"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Environment | \`$ENV_NAME\` |"
+            echo "| Region | \`${AWS_REGION:-not resolved}\` |"
+            echo "| Role ARN | \`${AWS_ROLE_ARN:-not resolved}\` |"
+            echo "| Branch | \`${{ github.ref_name }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Base | \`${BASE_SHA:-not required}\` |"
+            echo "| Trigger | Manual (\`workflow_dispatch\`) |"
+            echo "| Run ID | [\`${{ github.run_id }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+            echo ""
+
+            # ---------------- Change detection ----------------
+            echo "## Change Detection"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Source | \`${CHANGE_SOURCE:-not completed}\` |"
+            echo "| Has changes | \`${HAS_CHANGES:-false}\` |"
+            echo ""
+
+            if [ -n "${FUNCTIONS:-}" ]; then
+              echo "**Selected / detected functions**"
+              echo ""
+              echo '```text'
+              echo "$FUNCTIONS"
+              echo '```'
+              echo ""
+            fi
+
+            if [ -n "${CHANGED_FILES:-}" ]; then
+              echo "**Changed files inside Lambda folders**"
+              echo ""
+              echo "| Function | Status | File |"
+              echo "|---|---|---|"
+              while IFS=$'\t' read -r FN STATUS FILE; do
+                [ -z "$FN" ] && continue
+                echo "| \`$FN\` | $(gitstatus "$STATUS") | \`$FILE\` |"
+              done <<< "$CHANGED_FILES"
+              echo ""
+            fi
+
+            # ---------------- AWS authentication ----------------
+            echo "## AWS Authentication (OIDC)"
+            echo ""
+            echo "| Step | Result |"
+            echo "|---|---|"
+            echo "| Assume role | $(status "${CONFIGURE_OUTCOME:-}") |"
+            echo "| Verify identity | $(status "${VERIFY_OUTCOME:-}") |"
+            echo ""
+
+            # ---------------- Per-function results ----------------
+            echo "## Functions"
+            echo ""
+
+            if [ -z "${DEPLOYED:-}" ] && [ -z "${FAILED:-}" ]; then
+              echo "_No deployments were attempted._"
+              echo ""
+            else
+              echo "| Function | Status |"
+              echo "|---|---|"
+              if [ -n "${DEPLOYED:-}" ]; then
+                while IFS= read -r L; do
+                  [ -z "$L" ] && continue
+                  echo "| \`$L\` | ✅ deployed |"
+                done <<< "$DEPLOYED"
+              fi
+              if [ -n "${FAILED:-}" ]; then
+                while IFS= read -r L; do
+                  [ -z "$L" ] && continue
+                  echo "| \`$L\` | ❌ failed |"
+                done <<< "$FAILED"
+              fi
+              echo ""
+            fi
+
+            # ---------------- Overall outcome ----------------
+            echo "## Result"
+            echo ""
+
+            if [ "${BASE_OUTCOME:-}" = "failure" ]; then
+              echo "❌ **Base resolution failed.**"
+              echo ""
+              echo "Provide \`functions: <csv>\` or \`base: <ref/SHA>\` and retry."
+            elif [ "${CHANGES_OUTCOME:-}" = "failure" ]; then
+              echo "❌ **Change detection failed.** See the *Detect functions* step for details."
+            elif [ "${HAS_CHANGES:-false}" != "true" ]; then
+              echo "ℹ️ **No Lambda changes.** Nothing to deploy — AWS credentials were not requested."
+            elif [ "${DEPLOY_OUTCOME:-}" = "success" ]; then
+              echo "✅ **Deployment completed.** All selected functions were updated."
+            elif [ "${DEPLOY_OUTCOME:-}" = "failure" ]; then
+              echo "❌ **Deployment failed.** See the *Deploy functions* step for details."
+            elif [ "${DEPLOY_OUTCOME:-}" = "cancelled" ]; then
+              echo "🛑 **Deployment cancelled.**"
+            elif [ "${DEPLOY_OUTCOME:-}" = "skipped" ]; then
+              echo "⏭️ **Deployment skipped.**"
+            else
+              echo "⚠️ **Deployment did not complete normally.**"
+            fi
+            echo ""
+
+            # ---------------- Step-by-step timings ----------------
+            echo "## Step Status"
+            echo ""
+            echo "| Step | Outcome |"
+            echo "|---|---|"
+            echo "| Resolve base | $(status "${BASE_OUTCOME:-}") |"
+            echo "| Detect functions | $(status "${CHANGES_OUTCOME:-}") |"
+            echo "| Assume role (OIDC) | $(status "${CONFIGURE_OUTCOME:-}") |"
+            echo "| Verify identity | $(status "${VERIFY_OUTCOME:-}") |"
+            echo "| Deploy | $(status "${DEPLOY_OUTCOME:-}") |"
+            echo ""
+
+            echo "---"
+            echo ""
+            echo "Workflow: [\`${{ github.workflow }}\`](${{ github.server_url }}/${{ github.repository }}/actions/workflows/${{ github.workflow_ref }})  ·  "
+            echo "Run: [\`${{ github.run_id }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          } >> "$GITHUB_STEP_SUMMARY"
