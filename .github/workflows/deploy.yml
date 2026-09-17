@@ -61,6 +61,7 @@
 #     ...any other files
 # ============================================================
 
+
 name: Deploy Lambda Functions
 
 on:
@@ -101,24 +102,24 @@ permissions:
 jobs:
   deploy:
     # ────────────────────────────────────────────────────────────
-    # ⚠️ The "(<env>)" suffix in this name is REQUIRED by the
-    #    "Resolve comparison base" step, which filters prior runs
-    #    by displayTitle ending with "(dev)" / "(staging)" / "(prod)".
-    #    Do NOT rename without updating that step.
+    # The "(<env>)" suffix in this name is REQUIRED by the
+    # "Resolve comparison base" step, which filters prior runs
+    # by displayTitle ending with "(dev)" / "(staging)" / "(prod)".
+    # Do NOT rename without updating that step.
     # ────────────────────────────────────────────────────────────
     name: Deploy (${{ inputs.environment }})
     runs-on: windows-latest
 
-    # ⚠️ IMPORTANT: No `environment:` key here.
+    # IMPORTANT: No `environment:` key here.
     # Secrets are read from repository secrets, not GitHub Environments.
 
     env:
       INPUT_ENVIRONMENT: ${{ inputs.environment }}
-      INPUT_FUNCTIONS:   ${{ inputs.functions }}
-      INPUT_BASE:        ${{ inputs.base }}
+      INPUT_FUNCTIONS: ${{ inputs.functions }}
+      INPUT_BASE: ${{ inputs.base }}
 
-      BRANCH_NAME:       ${{ github.ref_name }}
-      COMMIT_SHA:        ${{ github.sha }}
+      BRANCH_NAME: ${{ github.ref_name }}
+      COMMIT_SHA: ${{ github.sha }}
 
     steps:
       # ========================================================
@@ -132,7 +133,7 @@ jobs:
           fetch-depth: 0
 
       # ========================================================
-      # 2. Setup GitHub CLI (used for base resolution)
+      # 2. Setup GitHub CLI
       # ========================================================
 
       - name: Setup GitHub CLI
@@ -151,10 +152,10 @@ jobs:
           python-version: "3.12"
 
       # ========================================================
-      # 4. Resolve comparison base  (git-only — no AWS)
+      # 4. Resolve comparison base
       #
       # Priority:
-      #   1. Explicit `base` input (validated).
+      #   1. Explicit `base` input.
       #   2. Last successful run whose displayTitle ends with
       #      "(<environment>)". NOT scoped by branch.
       #   3. Fail with a clear message.
@@ -210,8 +211,9 @@ jobs:
             echo "Scope    : all branches"
             echo ""
 
-            # Debug: show recent successful runs so we can see what exists
+            # Debug: show recent successful runs
             echo "--- Recent successful runs (any branch) ---"
+
             gh run list \
               --workflow "$GITHUB_WORKFLOW" \
               --status success \
@@ -219,11 +221,19 @@ jobs:
               --limit 15 \
               --jq '.[] | "\(.createdAt)  \(.headBranch)  \(.displayTitle)  \(.headSha)"' \
               || echo "(no runs found)"
+
             echo "-------------------------------------------"
             echo ""
 
+            # ----------------------------------------------------
             # Match runs whose displayTitle ends with "(<env>)"
-            # e.g. "Deploy (dev)" / "Deploy (staging)" / "Deploy (prod)"
+            #
+            # Examples:
+            #   Deploy (dev)
+            #   Deploy (staging)
+            #   Deploy (prod)
+            # ----------------------------------------------------
+
             LAST_SUCCESS_SHA="$(
               gh run list \
                 --workflow "$GITHUB_WORKFLOW" \
@@ -243,6 +253,7 @@ jobs:
 
               if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
                 echo "Fetching missing base commit..."
+
                 git fetch origin "$BASE"
 
                 if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
@@ -266,6 +277,7 @@ jobs:
               echo "or:"
               echo "  base: <branch/ref/SHA>"
               echo ""
+
               exit 1
             fi
           fi
@@ -290,7 +302,7 @@ jobs:
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
       # ========================================================
-      # 5. Detect changed functions  (git-only — no AWS)
+      # 5. Detect changed functions
       #
       # Detects ANY file change inside a Lambda folder.
       # A folder is a Lambda if it contains lambda_function.py.
@@ -367,6 +379,35 @@ jobs:
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             echo "source=manual" >> "$GITHUB_OUTPUT"
 
+            # ----------------------------------------------------
+            # Job Summary - Manual selection
+            # ----------------------------------------------------
+
+            {
+              echo "# Lambda Deployment Summary"
+              echo ""
+              echo "## Deployment Information"
+              echo ""
+              echo "| Property | Value |"
+              echo "|---|---|"
+              echo "| Environment | \`$INPUT_ENVIRONMENT\` |"
+              echo "| Branch | \`$BRANCH_NAME\` |"
+              echo "| Commit | \`$COMMIT_SHA\` |"
+              echo "| Detection Source | \`manual\` |"
+              echo ""
+              echo "## Selected Functions"
+              echo ""
+              echo '```text'
+              echo "$FUNCTIONS"
+              echo '```'
+              echo ""
+              echo "---"
+              echo ""
+              echo "Workflow: \`$GITHUB_WORKFLOW\`"
+              echo ""
+              echo "Run ID: \`$GITHUB_RUN_ID\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+
             exit 0
           fi
 
@@ -384,6 +425,7 @@ jobs:
           echo ""
           echo "Base:"
           echo "$BASE_SHA"
+
           echo ""
           echo "HEAD:"
           echo "$COMMIT_SHA"
@@ -416,9 +458,11 @@ jobs:
           while IFS=$'\t' read -r STATUS FILE; do
             [ -z "$FILE" ] && continue
 
+            # Strip CR characters
             FILE="$(printf '%s' "$FILE" | tr -d '\r')"
             STATUS="$(printf '%s' "$STATUS" | tr -d '\r')"
 
+            # Only files under a top-level folder
             case "$FILE" in
               */*)
                 FUNCTION="$(printf '%s' "$FILE" | cut -d '/' -f 1)"
@@ -429,13 +473,22 @@ jobs:
                 ;;
             esac
 
+            # Only treat as Lambda if the folder contains
+            # lambda_function.py
             if [ ! -f "$FUNCTION/lambda_function.py" ]; then
               continue
             fi
 
+            # Any file inside Lambda folder counts
             FUNCTIONS="${FUNCTIONS}${FUNCTION}"$'\n'
+
             FILE_ROWS="${FILE_ROWS}${FUNCTION}"$'\t'"${STATUS}"$'\t'"${FILE}"$'\n'
-          done < <(git diff --name-status "$BASE_SHA...HEAD")
+
+          done < <(
+            git diff \
+              --name-status \
+              "$BASE_SHA...HEAD"
+          )
 
           FUNCTIONS="$(
             printf '%s\n' "$FUNCTIONS" |
@@ -488,8 +541,40 @@ jobs:
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
 
+            # ----------------------------------------------------
+            # Job Summary - No changes
+            # ----------------------------------------------------
+
+            {
+              echo "# Lambda Deployment Summary"
+              echo ""
+              echo "## Deployment Information"
+              echo ""
+              echo "| Property | Value |"
+              echo "|---|---|"
+              echo "| Environment | \`$INPUT_ENVIRONMENT\` |"
+              echo "| Branch | \`$BRANCH_NAME\` |"
+              echo "| Commit | \`$COMMIT_SHA\` |"
+              echo "| Base | \`$BASE_SHA\` |"
+              echo "| Detection Source | \`diff\` |"
+              echo ""
+              echo "## Result"
+              echo ""
+              echo "No Lambda function changes detected."
+              echo ""
+              echo "---"
+              echo ""
+              echo "Workflow: \`$GITHUB_WORKFLOW\`"
+              echo ""
+              echo "Run ID: \`$GITHUB_RUN_ID\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+
             exit 0
           fi
+
+          # ------------------------------------------------------
+          # 5.5 Set outputs
+          # ------------------------------------------------------
 
           {
             echo "functions<<EOF"
@@ -504,12 +589,65 @@ jobs:
           echo "has_changes=true" >> "$GITHUB_OUTPUT"
           echo "source=diff" >> "$GITHUB_OUTPUT"
 
+          # ======================================================
+          # 5.6 GitHub Actions Job Summary
+          # ======================================================
+
+          {
+            echo "# Lambda Deployment Summary"
+            echo ""
+
+            echo "## Deployment Information"
+            echo ""
+
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Environment | \`$INPUT_ENVIRONMENT\` |"
+            echo "| Branch | \`$BRANCH_NAME\` |"
+            echo "| Commit | \`$COMMIT_SHA\` |"
+            echo "| Base | \`$BASE_SHA\` |"
+            echo "| Detection Source | \`diff\` |"
+
+            echo ""
+            echo "## Detected Functions"
+            echo ""
+
+            echo '```text'
+            echo "$FUNCTIONS"
+            echo '```'
+
+            echo ""
+            echo "## Changed Files Inside Lambda Folders"
+            echo ""
+
+            echo "| Function | Status | File |"
+            echo "|---|---|---|"
+
+            while IFS=$'\t' read -r FUNCTION STATUS FILE; do
+              [ -z "$FILE" ] && continue
+
+              echo "| \`$FUNCTION\` | \`$STATUS\` | \`$FILE\` |"
+
+            done <<< "$FILE_ROWS"
+
+            echo ""
+            echo "---"
+            echo ""
+
+            echo "Workflow: \`$GITHUB_WORKFLOW\`"
+            echo ""
+            echo "Run ID: \`$GITHUB_RUN_ID\`"
+
+          } >> "$GITHUB_STEP_SUMMARY"
+
           echo ""
-          echo "---"
-          echo ""
-          echo "Workflow: \`$GITHUB_WORKFLOW\`"
-          echo "Run: \`$GITHUB_RUN_ID\`"
-          echo "GITHUB_OUTPUT: \`$GITHUB_OUTPUT\`"
+          echo "=============================================="
+          echo "Detection completed"
+          echo "=============================================="
+          echo "Workflow: $GITHUB_WORKFLOW"
+          echo "Run ID: $GITHUB_RUN_ID"
+
+
 
       # # ========================================================
       # # 6. Resolve environment-specific credentials
