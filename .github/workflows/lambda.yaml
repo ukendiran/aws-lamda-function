@@ -79,16 +79,28 @@ jobs:
         run: |
           set -euo pipefail
 
+          # The workflow file path (unique). Prefer the ref so
+          # gh can find it even if names collide.
+          WORKFLOW_FILE="${GITHUB_WORKFLOW_REF%@*}"      # strip @refs/...
+          WORKFLOW_FILE="${WORKFLOW_FILE#*/${GITHUB_REPOSITORY}/}"
+
+          echo "Workflow file: $WORKFLOW_FILE"
+
           if [ -n "$INPUT_BASE" ]; then
             BASE="$INPUT_BASE"
             git fetch --all --tags --prune
           else
             echo "No base input — looking up last successful run for '$ENV_NAME'"
             BASE="$(
-              gh run list --workflow "$GITHUB_WORKFLOW" --status success \
-                --json headSha,displayTitle --limit 100 \
+              gh run list \
+                --workflow "$WORKFLOW_FILE" \
+                --status success \
+                --json headSha,displayTitle \
+                --limit 100 \
               | jq -r '.[] | [.headSha, .displayTitle] | @tsv' \
-              | grep -iF "($ENV_NAME)" | head -n1 | cut -f1
+              | grep -iF "($ENV_NAME)" \
+              | head -n1 \
+              | cut -f1
             )"
             if [ -z "$BASE" ]; then
               echo "ERROR: No previous successful deploy for '$ENV_NAME'."
@@ -101,7 +113,6 @@ jobs:
           git rev-parse --verify "$BASE^{commit}" >/dev/null
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "Resolved base: $BASE"
-
       # --------------------------------------------------------
       # 4. Detect changed Lambda folders
       #    - explicit list wins
