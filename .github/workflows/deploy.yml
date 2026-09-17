@@ -145,8 +145,9 @@ jobs:
       #
       # Priority:
       #   1. Explicit `base` input (validated).
-      #   2. Last successful run of this workflow, same branch,
-      #      same environment (via displayTitle filter).
+      #   2. Last successful run of this workflow for the SAME
+      #      ENVIRONMENT (matched on the "(env)" suffix in
+      #      displayTitle) — across ALL branches.
       #   3. Fail with a clear message.
       #
       # This step is SKIPPED when `functions` is provided.
@@ -189,23 +190,37 @@ jobs:
           else
             # ----------------------------------------------------
             # 4.2 Last successful deployment for THIS environment
-            #     on THIS branch
+            #     (environment-scoped, all branches)
             # ----------------------------------------------------
 
             echo "No base supplied."
             echo "Finding the last successful deployment for environment:"
-            echo "$INPUT_ENVIRONMENT"
+            echo "  $INPUT_ENVIRONMENT"
             echo "Workflow: $GITHUB_WORKFLOW"
-            echo "Branch  : $BRANCH_NAME"
+            echo "Scope   : all branches"
 
+            # Debug: show recent successful runs so we can see what's there
+            echo ""
+            echo "--- Recent successful runs (any branch) ---"
+            gh run list \
+              --workflow "$GITHUB_WORKFLOW" \
+              --status success \
+              --json headSha,displayTitle,headBranch,createdAt \
+              --limit 10 \
+              --jq '.[] | "\(.createdAt)  \(.headBranch)  \(.displayTitle)  \(.headSha)"' \
+              || echo "(no runs found)"
+            echo "-------------------------------------------"
+            echo ""
+
+            # Match runs whose displayTitle contains "(<env>)"
+            # e.g. "Detect and Deploy Lambda Functions (dev)"
             LAST_SUCCESS_SHA="$(
               gh run list \
                 --workflow "$GITHUB_WORKFLOW" \
-                --branch "$BRANCH_NAME" \
                 --status success \
-                --json headSha,displayTitle \
-                --limit 50 \
-                --jq ".[] | select(.displayTitle | test(\"($INPUT_ENVIRONMENT)\")) | .headSha" \
+                --json headSha,displayTitle,createdAt \
+                --limit 100 \
+                --jq ".[] | select(.displayTitle | contains(\"($INPUT_ENVIRONMENT)\")) | .headSha" \
                 | head -n1
             )"
 
