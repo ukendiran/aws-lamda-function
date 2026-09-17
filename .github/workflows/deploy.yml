@@ -4,10 +4,12 @@
 # Purpose:
 #   - Manual deployment only
 #   - Choose environment (dev | staging | prod) via workflow_dispatch
-#   - Deploy only affected Lambda functions (via git diff)
+#   - Deploy only affected Lambda functions
+#   - File-level change detection inside function folders
+#   - Skip non-deployable files (*.md, .gitignore, etc.)
 #   - Allow explicit function override
 #   - Allow explicit base ref/SHA
-#   - Detect shared-code and workflow-config changes
+#   - Detect common/ and workflow changes
 #   - Generate an accurate deployment summary
 #
 # Important:
@@ -17,10 +19,16 @@
 #   - AWS authentication uses OIDC (no long-lived keys).
 #
 # Required repository secrets:
-#   - AWS_ROLE_ARN           (shared, OIDC role)
-#   - AWS_REGION_DEV         (e.g. ap-south-1)
-#   - AWS_REGION_STAGING     (e.g. ap-south-1)
-#   - AWS_REGION_PROD        (e.g. ap-south-1)
+#   - AWS_ROLE_ARN          (shared, OIDC role)
+#   - AWS_REGION_DEV        (e.g. ap-south-1)
+#   - AWS_REGION_STAGING    (e.g. ap-south-1)
+#   - AWS_REGION_PROD       (e.g. ap-south-1)
+#
+# Required repository layout:
+#   <FunctionName>/
+#     lambda_function.py     (discovery marker)
+#     requirements.txt       (optional)
+#     ...other source files
 # ============================================================
 
 name: Deploy Lambda Functions
@@ -67,16 +75,14 @@ jobs:
 
     # ⚠️ IMPORTANT: No `environment:` key here.
     # Secrets are read from repository secrets, not GitHub Environments.
-    # The AWS role is the same across environments; region is switched
-    # by looking up the appropriate repo secret below.
 
     env:
       INPUT_ENVIRONMENT: ${{ inputs.environment }}
-      INPUT_FUNCTIONS: ${{ inputs.functions }}
-      INPUT_BASE: ${{ inputs.base }}
+      INPUT_FUNCTIONS:   ${{ inputs.functions }}
+      INPUT_BASE:        ${{ inputs.base }}
 
-      BRANCH_NAME: ${{ github.ref_name }}
-      COMMIT_SHA: ${{ github.sha }}
+      BRANCH_NAME:       ${{ github.ref_name }}
+      COMMIT_SHA:        ${{ github.sha }}
 
     steps:
       # ========================================================
@@ -90,7 +96,7 @@ jobs:
           fetch-depth: 0
 
       # ========================================================
-      # Setup GitHub CLI (needed to query last successful run)
+      # Setup GitHub CLI (used for base resolution)
       # ========================================================
 
       - name: Setup GitHub CLI
@@ -291,7 +297,6 @@ jobs:
               if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
                 echo ""
                 echo "Fetching missing base commit..."
-
                 git fetch origin "$BASE"
 
                 if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
@@ -337,7 +342,7 @@ jobs:
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
       # ========================================================
-      # Detect changed functions
+      # Detect changed functions (file-level)
       # ========================================================
 
       - name: Detect changed functions
@@ -349,7 +354,7 @@ jobs:
           set -euo pipefail
 
           echo "=============================================="
-          echo "Detecting changed functions"
+          echo "Detecting changed functions (file-level)"
           echo "=============================================="
 
           # ------------------------------------------------------
@@ -402,6 +407,10 @@ jobs:
               echo "functions<<EOF"
               echo "$FUNCTIONS"
               echo "EOF"
+
+              echo "changed_files<<EOF"
+              echo ""
+              echo "EOF"
             } >> "$GITHUB_OUTPUT"
 
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
@@ -424,7 +433,6 @@ jobs:
           echo ""
           echo "Base:"
           echo "$BASE_SHA"
-
           echo ""
           echo "HEAD:"
           echo "$COMMIT_SHA"
@@ -436,7 +444,7 @@ jobs:
           )"
 
           echo ""
-          echo "Changed files:"
+          echo "Changed files (raw):"
           echo "----------------------------------------------"
 
           if [ -n "$CHANGED_FILES" ]; then
@@ -448,8 +456,7 @@ jobs:
           echo "----------------------------------------------"
 
           # ------------------------------------------------------
-          # Detect shared-code changes
-          # (repo-root shared dir, e.g. common/)
+          # Detect shared code changes
           # ------------------------------------------------------
 
           if printf '%s\n' "$CHANGED_FILES" |
@@ -471,18 +478,18 @@ jobs:
           fi
 
           # ------------------------------------------------------
-          # Detect workflow / repo-config changes
+          # Detect workflow/config changes
           # ------------------------------------------------------
 
           if printf '%s\n' "$CHANGED_FILES" |
-            grep -qE '^\.github/workflows/deploy\.yml$|^\.github/actions/'; then
+            grep -qE '^\.github/'; then
 
             echo ""
             echo "=============================================="
             echo "Manual function selection required"
             echo "=============================================="
             echo ""
-            echo "Deployment workflow/config changes detected."
+            echo "GitHub workflow/config changes detected."
             echo ""
             echo "Please re-run the workflow with:"
             echo ""
@@ -493,12 +500,15 @@ jobs:
 
           # ------------------------------------------------------
           # Detect actual function directories only
-          # (a top-level dir containing lambda_function.py)
+          # with a deployable-file filter
           # ------------------------------------------------------
 
-          FUNCTIONS=""
+          DEPLOYABLE='(\.py|\.json|\.yaml|\.yml|\.toml|\.cfg|\.ini)$|^[^/]+/requirements\.txt$'
 
-          while IFS= read -r FILE; do
+          FUNCTIONS=""
+          FILE_ROWS=""
+
+          while IFS=$'\t' read -r STATUS FILE; do
             [ -z "$FILE" ] && continue
 
             case "$FILE" in
@@ -509,12 +519,20 @@ jobs:
                   continue
                 fi
 
-                if [ -f "$FUNCTION/lambda_function.py" ]; then
-                  FUNCTIONS="${FUNCTIONS}${FUNCTION}"$'\n'
+                if [ ! -f "$FUNCTION/lambda_function.py" ]; then
+                  continue
                 fi
+
+                if ! printf '%s' "$FILE" | grep -qE "$DEPLOYABLE"; then
+                  echo "Skipping non-deployable: $FILE"
+                  continue
+                fi
+
+                FUNCTIONS="${FUNCTIONS}${FUNCTION}"$'\n'
+                FILE_ROWS="${FILE_ROWS}${FUNCTION}"$'\t'"${STATUS}"$'\t'"${FILE}"$'\n'
                 ;;
             esac
-          done <<< "$CHANGED_FILES"
+          done < <(git diff --name-status "$BASE_SHA...HEAD")
 
           FUNCTIONS="$(
             printf '%s\n' "$FUNCTIONS" |
@@ -528,6 +546,18 @@ jobs:
 
           if [ -n "$FUNCTIONS" ]; then
             echo "$FUNCTIONS"
+          else
+            echo "None"
+          fi
+
+          echo "----------------------------------------------"
+
+          echo ""
+          echo "Changed deployable files:"
+          echo "----------------------------------------------"
+
+          if [ -n "$FILE_ROWS" ]; then
+            printf '%b' "$FILE_ROWS"
           else
             echo "None"
           fi
@@ -549,6 +579,10 @@ jobs:
               echo "functions<<EOF"
               echo ""
               echo "EOF"
+
+              echo "changed_files<<EOF"
+              echo ""
+              echo "EOF"
             } >> "$GITHUB_OUTPUT"
 
             exit 0
@@ -557,6 +591,10 @@ jobs:
           {
             echo "functions<<EOF"
             echo "$FUNCTIONS"
+            echo "EOF"
+
+            echo "changed_files<<EOF"
+            printf '%b' "$FILE_ROWS"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -595,7 +633,7 @@ jobs:
             Write-Host "----------------------------------------------"
 
             try {
-              $fnFull = "$function-$env_name"
+              $fnFull   = "$function-$env_name"
               $buildDir = "build\$function"
               $pkgPath  = "build\$function-$env_name.zip"
 
@@ -608,7 +646,7 @@ jobs:
 
               # Strip local-only folders
               Get-ChildItem -Path $buildDir -Recurse -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -in @('__pycache__','.venv','venv','.pytest_cache','scripts','.git') } |
+                Where-Object { $_.Name -in @('__pycache__','.venv','venv','.pytest_cache','scripts','.git','tests') } |
                 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
               # Install dependencies if requirements.txt exists
@@ -628,7 +666,7 @@ jobs:
               # Zip
               Compress-Archive -Path "$buildDir\*" -DestinationPath $pkgPath -Force
               $pkgFull = (Resolve-Path $pkgPath).Path
-              $sizeKB = [math]::Round((Get-Item $pkgFull).Length / 1KB, 1)
+              $sizeKB  = [math]::Round((Get-Item $pkgFull).Length / 1KB, 1)
               Write-Host ("Package: {0} ({1} KB)" -f $pkgFull, $sizeKB) -ForegroundColor Green
 
               # Ensure function exists
@@ -663,7 +701,6 @@ jobs:
           $deployedText = ($deployed -join "`n")
           $failedText   = ($failed   -join "`n")
 
-          # Write multiline outputs
           "deployed<<EOF`n$deployedText`nEOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "failed<<EOF`n$failedText`nEOF"     | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
@@ -682,6 +719,7 @@ jobs:
         shell: bash
         env:
           FUNCTIONS:        ${{ steps.changes.outputs.functions }}
+          CHANGED_FILES:    ${{ steps.changes.outputs.changed_files }}
           DEPLOYED:         ${{ steps.deploy.outputs.deployed }}
           FAILED:           ${{ steps.deploy.outputs.failed }}
           HAS_CHANGES:      ${{ steps.changes.outputs.has_changes }}
@@ -743,6 +781,38 @@ jobs:
               echo ""
 
             else
+
+              # --------------------------------------------------
+              # Changed files per function (file-level detail)
+              # --------------------------------------------------
+
+              if [ -n "${CHANGED_FILES:-}" ]; then
+                echo "## Changed Files"
+                echo ""
+                echo "| Function | Status | File |"
+                echo "|---|---|---|"
+
+                while IFS=$'\t' read -r FN STATUS FILE; do
+                  [ -z "$FN" ] && continue
+
+                  case "$STATUS" in
+                    A*) SYMBOL="🆕 Added" ;;
+                    M*) SYMBOL="✏️ Modified" ;;
+                    D*) SYMBOL="🗑️ Deleted" ;;
+                    R*) SYMBOL="🔀 Renamed" ;;
+                    C*) SYMBOL="📄 Copied" ;;
+                    *)  SYMBOL="$STATUS" ;;
+                  esac
+
+                  echo "| \`$FN\` | $SYMBOL | \`$FILE\` |"
+                done <<< "$CHANGED_FILES"
+
+                echo ""
+              fi
+
+              # --------------------------------------------------
+              # Deployment status per function
+              # --------------------------------------------------
 
               echo "## Functions"
               echo ""
