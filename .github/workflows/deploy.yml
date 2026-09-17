@@ -1,0 +1,254 @@
+name: Deploy to AWS Lambda
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      function:
+        description: "Function folder to deploy ('all' for every function)"
+        required: true
+        default: "all"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # 1. DISCOVER — scan the repo for Lambda function folders
+  # ────────────────────────────────────────────────────────────────
+  discover:
+    name: Discover Lambda functions
+    runs-on: ubuntu-latest
+    outputs:
+      functions: ${{ steps.find.outputs.functions }}
+      count:     ${{ steps.find.outputs.count }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Find Lambda function folders
+        id: find
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A "Lambda function" = a top-level folder containing lambda_function.py
+          candidates=$(find . -maxdepth 2 -type f -name 'lambda_function.py' \
+                          -printf '%h\n' | sed 's|^\./||' | sort -u)
+
+          echo "Discovered folders:"
+          echo "$candidates"
+
+          wanted="${{ github.event.inputs.function }}"
+          if [ "$wanted" != "all" ]; then
+            echo "Filtering to: $wanted"
+            candidates=$(echo "$candidates" | grep -x "$wanted" || true)
+          fi
+
+          if [ -z "$candidates" ]; then
+            echo "::error::No Lambda functions matched (filter='$wanted')"
+            exit 1
+          fi
+
+          json=$(printf '%s\n' "$candidates" \
+                 | jq -R -s -c 'split("\n") | map(select(length>0)) | map({name: ., path: .})')
+
+          count=$(echo "$json" | jq 'length')
+
+          echo "Matrix: $json"
+          echo "Count : $count"
+          echo "functions=$json" >> "$GITHUB_OUTPUT"
+          echo "count=$count"     >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────────────────────────
+  # 2. DEPLOY — one matrix leg per discovered function
+  # ────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy ${{ matrix.function.name }} → ${{ github.event.inputs.environment }}
+    needs: discover
+    runs-on: windows-latest
+    environment: ${{ github.event.inputs.environment }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        function: ${{ fromJson(needs.discover.outputs.functions) }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve region secret name
+        id: resolve-region
+        shell: powershell
+        run: |
+          $environment = "${{ github.event.inputs.environment }}"
+          $secretMap = @{
+            "dev"     = "AWS_REGION_DEV"
+            "staging" = "AWS_REGION_STAGING"
+            "prod"    = "AWS_REGION_PROD"
+          }
+          $secretName = $secretMap[$environment]
+          if (-not $secretName) { throw "Unknown environment: $environment" }
+
+          Write-Host "Environment: $environment" -ForegroundColor Cyan
+          Write-Host "Secret name: $secretName" -ForegroundColor Cyan
+
+          echo "SECRET_NAME=$secretName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets[steps.resolve-region.outputs.SECRET_NAME] }}
+
+      - name: Verify AWS identity
+        shell: powershell
+        run: aws sts get-caller-identity
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build deployment package
+        id: build
+        working-directory: ${{ matrix.function.path }}
+        shell: powershell
+        run: |
+          $env_name = "${{ github.event.inputs.environment }}"
+          $fn_name  = "${{ matrix.function.name }}"
+          $buildDir = "..\build\$fn_name"
+          $pkgPath  = "..\build\$fn_name-$env_name.zip"
+
+          Write-Host "Building $fn_name for $env_name" -ForegroundColor Yellow
+
+          # Clean previous build artifacts
+          if (Test-Path "..\build\$fn_name") { Remove-Item "..\build\$fn_name" -Recurse -Force }
+          if (Test-Path $pkgPath)             { Remove-Item $pkgPath -Force }
+          New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+
+          # Copy function source
+          Copy-Item -Path ".\*" -Destination $buildDir -Recurse -Force
+
+          # Install dependencies into the build folder if requirements.txt exists
+          if (Test-Path ".\requirements.txt") {
+            Write-Host "Installing dependencies..." -ForegroundColor Cyan
+            python -m pip install --upgrade pip | Out-Null
+            python -m pip install -r requirements.txt -t $buildDir `
+              --platform manylinux2014_x86_64 `
+              --only-binary=:all: `
+              --implementation cp `
+              --python-version 3.12 `
+              --upgrade
+          }
+
+          # Zip everything in build folder
+          Compress-Archive -Path "$buildDir\*" -DestinationPath $pkgPath -Force
+
+          $size = (Get-Item $pkgPath).Length / 1KB
+          Write-Host ("Package created: {0} ({1:N1} KB)" -f $pkgPath, $size) -ForegroundColor Green
+
+          echo "PKG_PATH=$pkgPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Deploy Lambda function
+        working-directory: ${{ matrix.function.path }}
+        shell: powershell
+        run: |
+          $env_name  = "${{ github.event.inputs.environment }}"
+          $fn_name   = "${{ matrix.function.name }}"
+          $fn_full   = "$fn_name-$env_name"
+          $region    = "${{ secrets[steps.resolve-region.outputs.SECRET_NAME] }}"
+          $pkg       = "..\build\$fn_name-$env_name.zip"
+
+          Write-Host "Deploying $fn_full" -ForegroundColor Yellow
+          Write-Host "Region:   $region"   -ForegroundColor Yellow
+          Write-Host "Package:  $pkg"      -ForegroundColor Yellow
+
+          # Check if the function exists
+          $exists = $true
+          try {
+            aws lambda get-function --function-name $fn_full --region $region 2>$null | Out-Null
+          } catch {
+            $exists = $false
+          }
+
+          if ($exists) {
+            Write-Host "Updating existing function..." -ForegroundColor Cyan
+            aws lambda update-function-code `
+              --function-name $fn_full `
+              --zip-file "fileb://$pkg" `
+              --region $region
+
+            if ($LASTEXITCODE -ne 0) { throw "update-function-code failed ($LASTEXITCODE)" }
+
+            aws lambda wait function-updated `
+              --function-name $fn_full `
+              --region $region
+          }
+          else {
+            Write-Host "Function does not exist. Create it manually first, or extend this step." -ForegroundColor Red
+            throw "Lambda $fn_full not found in $region. Create it before deploying."
+          }
+
+      - name: Smoke test (invoke function)
+        shell: powershell
+        run: |
+          $env_name = "${{ github.event.inputs.environment }}"
+          $fn_name  = "${{ matrix.function.name }}"
+          $fn_full  = "$fn_name-$env_name"
+          $region   = "${{ secrets[steps.resolve-region.outputs.SECRET_NAME] }}"
+
+          Write-Host "Invoking $fn_full..." -ForegroundColor Cyan
+
+          # Skip smoke test for functions that need real input
+          if ($fn_name -eq "DynamoDbWriter") {
+            Write-Host "Skipping smoke test for $fn_name (requires TABLE_NAME + payload)" -ForegroundColor Yellow
+            exit 0
+          }
+
+          $outFile = "..\build\$fn_name-response.json"
+          aws lambda invoke `
+            --function-name $fn_full `
+            --region $region `
+            --payload '{}' `
+            --cli-binary-format raw-in-base64-out `
+            $outFile | Out-Null
+
+          if ($LASTEXITCODE -ne 0) { throw "invoke failed ($LASTEXITCODE)" }
+
+          Write-Host "Response:" -ForegroundColor Green
+          Get-Content $outFile
+
+  # ────────────────────────────────────────────────────────────────
+  # 3. SUMMARY — nice to have in the Actions UI
+  # ────────────────────────────────────────────────────────────────
+  summary:
+    name: Deployment summary
+    needs: [discover, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print summary
+        run: |
+          echo "## Lambda Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** \`${{ github.event.inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Filter:** \`${{ github.event.inputs.function }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Functions discovered:** ${{ needs.discover.outputs.count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deploy job result:** \`${{ needs.deploy.result }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Functions" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          echo '${{ needs.discover.outputs.functions }}' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
