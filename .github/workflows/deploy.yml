@@ -490,9 +490,7 @@ jobs:
             echo "---"
             echo ""
             echo "Workflow: \`$GITHUB_WORKFLOW\`"
-            echo "Run: \`$GITHUB_RUN_ID\`"
-
-          } >> "$GITHUB_STEP
+            echo "source=diff" >> "$GITHUB_OUTPUT"
 
       # # ========================================================
       # # 6. Resolve environment-specific credentials
