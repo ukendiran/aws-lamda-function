@@ -79,10 +79,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The workflow file path (unique). Prefer the ref so
-          # gh can find it even if names collide.
-          WORKFLOW_FILE="${GITHUB_WORKFLOW_REF%@*}"      # strip @refs/...
-          WORKFLOW_FILE="${WORKFLOW_FILE#*/${GITHUB_REPOSITORY}/}"
+          # Resolve this workflow's FILE PATH (unique).
+          # GITHUB_WORKFLOW_REF looks like:
+          #   <owner>/<repo>/.github/workflows/<file>@<ref>
+          WORKFLOW_FILE="${GITHUB_WORKFLOW_REF%@*}"               # drop @<ref>
+          WORKFLOW_FILE="${WORKFLOW_FILE#${GITHUB_REPOSITORY}/}"  # drop <owner>/<repo>/
 
           echo "Workflow file: $WORKFLOW_FILE"
 
@@ -113,6 +114,7 @@ jobs:
           git rev-parse --verify "$BASE^{commit}" >/dev/null
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "Resolved base: $BASE"
+
       # --------------------------------------------------------
       # 4. Detect changed Lambda folders
       #    - explicit list wins
