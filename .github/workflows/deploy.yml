@@ -1,206 +1,203 @@
-name: Deploy to AWS Lambda
+# ============================================================
+# AWS Lambda Functions - Deployment (Dev + Staging + Prod)
+#
+# Purpose:
+#   - Manual deployment only
+#   - Choose environment (dev | staging | prod) via workflow_dispatch
+#   - Deploy only affected Lambda functions (via git diff)
+#   - Allow explicit function override
+#   - Allow explicit base ref/SHA
+#   - Detect shared-code and workflow-config changes
+#   - Generate an accurate deployment summary
+#
+# Important:
+#   - Does NOT use GitHub Environments.
+#   - Secrets are repository-level only.
+#   - The `environment` input is used purely as a switch-case selector.
+#   - AWS authentication uses OIDC (no long-lived keys).
+#
+# Required repository secrets:
+#   - AWS_ROLE_ARN           (shared, OIDC role)
+#   - AWS_REGION_DEV         (e.g. ap-south-1)
+#   - AWS_REGION_STAGING     (e.g. ap-south-1)
+#   - AWS_REGION_PROD        (e.g. ap-south-1)
+# ============================================================
+
+name: Deploy Lambda Functions
 
 on:
   workflow_dispatch:
     inputs:
       environment:
-        description: "Target environment"
+        description: Deployment environment
         required: true
-        default: "dev"
-        type: choice
-        options: [dev, staging, prod]
-      function:
-        description: "Function folder to deploy, or 'changed' for auto-detect, or 'all'"
-        required: true
-        default: "changed"
         type: choice
         options:
-          - changed
-          - all
-          - HelloWorld
-          - S3ListBuckets
-          - DynamoDbWriter
-          - S3SyncDataWeaviate
-      lookback_commits:
-        description: "How many recent commits to scan for changes"
-        required: true
-        default: "5"
-        type: string
+          - dev
+          - staging
+          - prod
+        default: dev
 
-  push:
-    branches: [main]
-    paths:
-      - '*/lambda_function.py'
-      - '*/requirements.txt'
-      - '*/utils/**'
-      - '*/common/**'
-      - '.github/workflows/deploy.yml'
+      functions:
+        description: >-
+          Optional comma-separated function folder names to deploy.
+          Example: HelloWorld,S3ListBuckets
+        required: false
+        type: string
+        default: ""
+
+      base:
+        description: >-
+          Optional base ref/SHA for change detection.
+          Leave empty to use the last successful deployment of this workflow
+          on the selected branch and environment.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
+  actions: read
   id-token: write
 
 jobs:
-  # ────────────────────────────────────────────────────────────────
-  # 1. DISCOVER — find Lambdas that changed recently
-  # ────────────────────────────────────────────────────────────────
-  discover:
-    name: Discover changed Lambda functions
-    runs-on: ubuntu-latest
-    outputs:
-      functions: ${{ steps.find.outputs.functions }}
-      count:     ${{ steps.find.outputs.count }}
-      mode:      ${{ steps.find.outputs.mode }}
+  deploy:
+    name: Detect and Deploy Lambda Functions (${{ inputs.environment }})
+    runs-on: windows-latest
+
+    # ⚠️ IMPORTANT: No `environment:` key here.
+    # Secrets are read from repository secrets, not GitHub Environments.
+    # The AWS role is the same across environments; region is switched
+    # by looking up the appropriate repo secret below.
+
+    env:
+      INPUT_ENVIRONMENT: ${{ inputs.environment }}
+      INPUT_FUNCTIONS: ${{ inputs.functions }}
+      INPUT_BASE: ${{ inputs.base }}
+
+      BRANCH_NAME: ${{ github.ref_name }}
+      COMMIT_SHA: ${{ github.sha }}
+
     steps:
-      - name: Checkout code
+      # ========================================================
+      # Checkout
+      # ========================================================
+
+      - name: Checkout selected branch
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0            # full history so we can diff
+          ref: ${{ github.ref }}
+          fetch-depth: 0
 
-      - name: Find Lambda function folders with recent changes
-        id: find
+      # ========================================================
+      # Setup GitHub CLI (needed to query last successful run)
+      # ========================================================
+
+      - name: Setup GitHub CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh --version
+
+      # ========================================================
+      # Resolve environment-specific credentials
+      #
+      # Switch on INPUT_ENVIRONMENT to pick the right region.
+      # The AWS role ARN is shared between environments (OIDC).
+      #
+      # Exports:
+      #   AWS_ROLE_ARN  (shared)
+      #   AWS_REGION    (env-specific)
+      # to $GITHUB_ENV for later steps.
+      # ========================================================
+
+      - name: Resolve environment credentials
+        shell: bash
+        env:
+          SECRET_AWS_ROLE_ARN:       ${{ secrets.AWS_ROLE_ARN }}
+          SECRET_AWS_REGION_DEV:     ${{ secrets.AWS_REGION_DEV }}
+          SECRET_AWS_REGION_STAGING: ${{ secrets.AWS_REGION_STAGING }}
+          SECRET_AWS_REGION_PROD:    ${{ secrets.AWS_REGION_PROD }}
+        run: |
+          set -euo pipefail
+
+          echo "=============================================="
+          echo "Resolving credentials for: $INPUT_ENVIRONMENT"
+          echo "=============================================="
+
+          case "$INPUT_ENVIRONMENT" in
+            dev)
+              ROLE_ARN="$SECRET_AWS_ROLE_ARN"
+              REGION="$SECRET_AWS_REGION_DEV"
+              ;;
+            staging)
+              ROLE_ARN="$SECRET_AWS_ROLE_ARN"
+              REGION="$SECRET_AWS_REGION_STAGING"
+              ;;
+            prod)
+              ROLE_ARN="$SECRET_AWS_ROLE_ARN"
+              REGION="$SECRET_AWS_REGION_PROD"
+              ;;
+            *)
+              echo "ERROR: Unsupported environment: $INPUT_ENVIRONMENT"
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$ROLE_ARN" ]; then
+            echo "ERROR: Missing AWS_ROLE_ARN repo secret."
+            exit 1
+          fi
+
+          if [ -z "$REGION" ]; then
+            echo "ERROR: Missing AWS region for environment: $INPUT_ENVIRONMENT"
+            echo "       Check repo secret AWS_REGION_DEV / AWS_REGION_STAGING / AWS_REGION_PROD."
+            exit 1
+          fi
+
+          {
+            echo "AWS_ROLE_ARN=$ROLE_ARN"
+            echo "AWS_REGION=$REGION"
+          } >> "$GITHUB_ENV"
+
+          echo "Credentials resolved:"
+          echo "  Environment : $INPUT_ENVIRONMENT"
+          echo "  Region      : $REGION"
+          echo "  Role        : $ROLE_ARN"
+
+      # ========================================================
+      # Deployment information
+      # ========================================================
+
+      - name: Deployment information
         shell: bash
         run: |
           set -euo pipefail
 
-          # ────────────────────────────────────────────────────────
-          # 1. Determine filter mode
-          #    - Manual run  → use workflow input
-          #    - Push run    → auto = "changed"
-          # ────────────────────────────────────────────────────────
-          mode="${{ github.event.inputs.function || 'changed' }}"
-          lookback="${{ github.event.inputs.lookback_commits || '5' }}"
+          echo "=============================================="
+          echo "AWS Lambda Functions - $INPUT_ENVIRONMENT"
+          echo "=============================================="
+          echo "Branch       : $BRANCH_NAME"
+          echo "Commit       : $COMMIT_SHA"
+          echo "Region       : $AWS_REGION"
+          echo "Role         : $AWS_ROLE_ARN"
+          echo "Manual input : ${INPUT_FUNCTIONS:-<none>}"
+          echo "Base input   : ${INPUT_BASE:-<auto>}"
+          echo "=============================================="
 
-          echo "Mode      : $mode"
-          echo "Lookback  : $lookback commits"
+      # ========================================================
+      # Configure AWS credentials (OIDC)
+      # ========================================================
 
-          # ────────────────────────────────────────────────────────
-          # 2. All Lambda folders in repo (top-level with lambda_function.py)
-          # ────────────────────────────────────────────────────────
-          all_fns=$(find . -maxdepth 2 -type f -name 'lambda_function.py' \
-                      -printf '%h\n' | sed 's|^\./||' | sort -u)
-
-          echo "All Lambda folders:"
-          echo "$all_fns"
-
-          if [ -z "$all_fns" ]; then
-            echo "::error::No Lambda folders found."
-            exit 1
-          fi
-
-          # ────────────────────────────────────────────────────────
-          # 3. Compute "recently changed" folders
-          # ────────────────────────────────────────────────────────
-          # Range: last N commits on current branch
-          if git rev-parse "HEAD~$lookback" >/dev/null 2>&1; then
-            range="HEAD~$lookback..HEAD"
-          else
-            range="HEAD"           # shallow history — treat all as changed
-          fi
-          echo "Diff range: $range"
-
-          changed=$(git log --name-only --pretty=format: "$range" 2>/dev/null \
-                    | grep -v '^$' | awk -F/ '{print $1}' | sort -u)
-
-          echo "Changed top-level entries in last $lookback commits:"
-          echo "$changed"
-
-          # Intersect: changed ∩ all_fns
-          changed_fns=""
-          for fn in $all_fns; do
-            for c in $changed; do
-              if [ "$fn" = "$c" ]; then changed_fns="$changed_fns $fn"; fi
-            done
-          done
-          changed_fns=$(echo "$changed_fns" | tr ' ' '\n' | sort -u | sed '/^$/d')
-
-          echo "Changed Lambda folders:"
-          echo "$changed_fns"
-
-          # ────────────────────────────────────────────────────────
-          # 4. Apply mode to pick final list
-          # ────────────────────────────────────────────────────────
-          case "$mode" in
-            all)
-              selected="$all_fns"
-              ;;
-            changed)
-              selected="$changed_fns"
-              ;;
-            *)
-              # Specific function name was requested
-              if echo "$all_fns" | grep -qx "$mode"; then
-                selected="$mode"
-              else
-                echo "::error::Function '$mode' not found in repo."
-                exit 1
-              fi
-              ;;
-          esac
-
-          echo "Selected for deploy:"
-          echo "$selected"
-
-          if [ -z "$selected" ]; then
-            echo "::notice::No Lambda functions to deploy."
-            echo "functions=[]" >> "$GITHUB_OUTPUT"
-            echo "count=0"     >> "$GITHUB_OUTPUT"
-            echo "mode=$mode"  >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # ────────────────────────────────────────────────────────
-          # 5. Build matrix JSON
-          # ────────────────────────────────────────────────────────
-          json=$(printf '%s\n' "$selected" \
-                 | jq -R -s -c 'split("\n") | map(select(length>0)) | map({name: ., path: .})')
-          count=$(echo "$json" | jq 'length')
-
-          echo "Matrix: $json"
-          echo "Count : $count"
-
-          echo "functions=$json" >> "$GITHUB_OUTPUT"
-          echo "count=$count"     >> "$GITHUB_OUTPUT"
-          echo "mode=$mode"       >> "$GITHUB_OUTPUT"
-
-  # ────────────────────────────────────────────────────────────────
-  # 2. DEPLOY — one matrix leg per changed function
-  # ────────────────────────────────────────────────────────────────
-  deploy:
-    name: Deploy ${{ matrix.function.name }} → ${{ github.event.inputs.environment || 'dev' }}
-    needs: discover
-    if: needs.discover.outputs.count != '0'
-    runs-on: windows-latest
-    environment: ${{ github.event.inputs.environment || 'dev' }}
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        function: ${{ fromJson(needs.discover.outputs.functions) }}
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Resolve region secret name
-        id: resolve-region
-        shell: powershell
-        run: |
-          $environment = "${{ github.event.inputs.environment || 'dev' }}"
-          $secretMap = @{
-            "dev"     = "AWS_REGION_DEV"
-            "staging" = "AWS_REGION_STAGING"
-            "prod"    = "AWS_REGION_PROD"
-          }
-          $secretName = $secretMap[$environment]
-          if (-not $secretName) { throw "Unknown environment: $environment" }
-          echo "SECRET_NAME=$secretName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v5
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets[steps.resolve-region.outputs.SECRET_NAME] }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ========================================================
+      # Verify AWS identity
+      # ========================================================
 
       - name: Verify AWS identity
         shell: powershell
@@ -208,136 +205,606 @@ jobs:
           $id = aws sts get-caller-identity | ConvertFrom-Json
           Write-Host "Assumed ARN : $($id.Arn)"
           Write-Host "Account     : $($id.Account)"
-          $roleName = ("${{ secrets.AWS_ROLE_ARN }}" -split '/')[-1]
+          Write-Host "UserId      : $($id.UserId)"
+
+          $roleName = ("${{ env.AWS_ROLE_ARN }}" -split '/')[-1]
           if ($id.Arn -notlike "*$roleName*") {
             throw "Unexpected identity: $($id.Arn). Expected role containing '$roleName'."
           }
+
+      # ========================================================
+      # Setup Python
+      # ========================================================
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Build deployment package
-        working-directory: ${{ matrix.function.path }}
-        shell: powershell
+      # ========================================================
+      # Resolve comparison base
+      # ========================================================
+
+      - name: Resolve comparison base
+        id: base
+        if: ${{ env.INPUT_FUNCTIONS == '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $env_name = "${{ github.event.inputs.environment || 'dev' }}"
-          $fn_name  = "${{ matrix.function.name }}"
-          $buildDir = "..\build\$fn_name"
-          $pkgPath  = "..\build\$fn_name-$env_name.zip"
+          set -euo pipefail
 
-          if (Test-Path "..\build\$fn_name") { Remove-Item "..\build\$fn_name" -Recurse -Force }
-          if (Test-Path $pkgPath)             { Remove-Item $pkgPath -Force }
-          New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+          echo "=============================================="
+          echo "Resolving comparison base"
+          echo "=============================================="
 
-          Copy-Item -Path ".\*" -Destination $buildDir -Recurse -Force
+          BASE=""
 
-          # Remove local-only junk
-          Get-ChildItem -Path $buildDir -Recurse -Directory |
-            Where-Object { $_.Name -in @('__pycache__','.venv','venv','.pytest_cache','scripts','.git') } |
-            Remove-Item -Recurse -Force
+          # ------------------------------------------------------
+          # 1. Manual base supplied
+          # ------------------------------------------------------
 
-          if (Test-Path ".\requirements.txt") {
-            Write-Host "Installing dependencies..." -ForegroundColor Cyan
-            python -m pip install --upgrade pip | Out-Null
-            python -m pip install -r requirements.txt -t $buildDir `
-              --platform manylinux2014_x86_64 `
-              --only-binary=:all: `
-              --implementation cp `
-              --python-version 3.12 `
-              --upgrade
-          }
+          if [ -n "$INPUT_BASE" ]; then
+            echo "Using manually supplied base:"
+            echo "$INPUT_BASE"
 
-          Compress-Archive -Path "$buildDir\*" -DestinationPath $pkgPath -Force
+            BASE="$INPUT_BASE"
 
-          $size = (Get-Item $pkgPath).Length / 1KB
-          Write-Host ("Package: {0} ({1:N1} KB)" -f $pkgPath, $size) -ForegroundColor Green
+            git fetch --all --tags --prune
 
-      - name: Deploy Lambda function
-        working-directory: ${{ matrix.function.path }}
-        shell: powershell
+            if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
+              echo ""
+              echo "ERROR: Base ref/SHA does not exist:"
+              echo "$BASE"
+              exit 1
+            fi
+
+          else
+            # ----------------------------------------------------
+            # 2. Last successful deployment for THIS environment
+            # ----------------------------------------------------
+
+            echo "No base supplied."
+            echo "Finding the last successful deployment for environment:"
+            echo "$INPUT_ENVIRONMENT"
+            echo "Workflow: $GITHUB_WORKFLOW"
+            echo "Branch  : $BRANCH_NAME"
+
+            LAST_SUCCESS_SHA="$(
+              gh run list \
+                --workflow "$GITHUB_WORKFLOW" \
+                --branch "$BRANCH_NAME" \
+                --status success \
+                --json headSha,displayTitle \
+                --limit 50 \
+                --jq ".[] | select(.displayTitle | test(\"($INPUT_ENVIRONMENT)\")) | .headSha" \
+                | head -n1
+            )"
+
+            if [ -n "$LAST_SUCCESS_SHA" ]; then
+              BASE="$LAST_SUCCESS_SHA"
+
+              echo ""
+              echo "Last successful $INPUT_ENVIRONMENT deployment found:"
+              echo "$BASE"
+
+              if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
+                echo ""
+                echo "Fetching missing base commit..."
+
+                git fetch origin "$BASE"
+
+                if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
+                  echo ""
+                  echo "ERROR: Unable to resolve base commit:"
+                  echo "$BASE"
+                  exit 1
+                fi
+              fi
+
+            else
+              echo ""
+              echo "ERROR: Could not find a previous successful $INPUT_ENVIRONMENT deployment."
+              echo ""
+              echo "This is expected for the first deployment of this environment."
+              echo ""
+              echo "Please provide either:"
+              echo "  functions: HelloWorld,S3ListBuckets"
+              echo "or:"
+              echo "  base: <branch/ref/SHA>"
+              echo ""
+              exit 1
+            fi
+          fi
+
+          # ------------------------------------------------------
+          # Final validation
+          # ------------------------------------------------------
+
+          if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
+            echo ""
+            echo "ERROR: Unable to resolve comparison base:"
+            echo "$BASE"
+            exit 1
+          fi
+
+          echo ""
+          echo "=============================================="
+          echo "Resolved base:"
+          echo "$BASE"
+          echo "=============================================="
+
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      # ========================================================
+      # Detect changed functions
+      # ========================================================
+
+      - name: Detect changed functions
+        id: changes
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.base }}
         run: |
-          $env_name = "${{ github.event.inputs.environment || 'dev' }}"
-          $fn_name  = "${{ matrix.function.name }}"
-          $fn_full  = "$fn_name-$env_name"
-          $region   = "${{ secrets[steps.resolve-region.outputs.SECRET_NAME] }}"
-          $pkg      = (Resolve-Path "..\build\$fn_name-$env_name.zip").Path
+          set -euo pipefail
 
-          Write-Host "Deploying $fn_full" -ForegroundColor Yellow
-          Write-Host "Region   : $region" -ForegroundColor Yellow
-          Write-Host "Package  : $pkg"    -ForegroundColor Yellow
+          echo "=============================================="
+          echo "Detecting changed functions"
+          echo "=============================================="
 
-          aws lambda get-function --function-name $fn_full --region $region 2>$null | Out-Null
-          if ($LASTEXITCODE -ne 0) {
-            throw "Lambda '$fn_full' not found in $region. Create it before deploying."
-          }
+          # ------------------------------------------------------
+          # Explicit function input
+          # ------------------------------------------------------
 
-          aws lambda update-function-code `
-            --function-name $fn_full `
-            --zip-file "fileb://$pkg" `
-            --region $region
+          if [ -n "$INPUT_FUNCTIONS" ]; then
+            echo ""
+            echo "Explicit function list supplied."
+            echo "Automatic change detection will be skipped."
 
-          if ($LASTEXITCODE -ne 0) { throw "update-function-code failed ($LASTEXITCODE)" }
+            FUNCTIONS="$(
+              printf '%s' "$INPUT_FUNCTIONS" |
+                tr ',' '\n' |
+                sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
+                sed '/^$/d' |
+                sort -u
+            )"
 
-          aws lambda wait function-updated `
-            --function-name $fn_full `
-            --region $region
+            if [ -z "$FUNCTIONS" ]; then
+              echo ""
+              echo "ERROR: The functions input did not contain any function names."
+              exit 1
+            fi
 
-          if ($LASTEXITCODE -ne 0) { throw "wait function-updated failed ($LASTEXITCODE)" }
+            while IFS= read -r FUNCTION; do
+              [ -z "$FUNCTION" ] && continue
 
-      - name: Smoke test (invoke function)
-        shell: powershell
-        run: |
-          $env_name = "${{ github.event.inputs.environment || 'dev' }}"
-          $fn_name  = "${{ matrix.function.name }}"
-          $fn_full  = "$fn_name-$env_name"
-          $region   = "${{ secrets[steps.resolve-region.outputs.SECRET_NAME] }}"
+              if ! printf '%s' "$FUNCTION" | grep -Eq '^[A-Za-z0-9_-]+$'; then
+                echo ""
+                echo "ERROR: Invalid function name:"
+                echo "$FUNCTION"
+                echo "Allowed characters: A-Z, a-z, 0-9, underscore, hyphen."
+                exit 1
+              fi
 
-          if ($fn_name -eq "DynamoDbWriter") {
-            Write-Host "Skipping smoke test for $fn_name (requires TABLE_NAME + payload)" -ForegroundColor Yellow
+              if [ ! -f "$FUNCTION/lambda_function.py" ]; then
+                echo ""
+                echo "ERROR: Function does not exist:"
+                echo "$FUNCTION/lambda_function.py"
+                exit 1
+              fi
+            done <<< "$FUNCTIONS"
+
+            echo ""
+            echo "Functions selected explicitly:"
+            echo "$FUNCTIONS"
+
+            {
+              echo "functions<<EOF"
+              echo "$FUNCTIONS"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "source=manual" >> "$GITHUB_OUTPUT"
+
             exit 0
+          fi
+
+          # ------------------------------------------------------
+          # Automatic change detection
+          # ------------------------------------------------------
+
+          if [ -z "$BASE_SHA" ]; then
+            echo ""
+            echo "ERROR: No comparison base was resolved."
+            echo "Please provide the 'base' input or explicit 'functions'."
+            exit 1
+          fi
+
+          echo ""
+          echo "Base:"
+          echo "$BASE_SHA"
+
+          echo ""
+          echo "HEAD:"
+          echo "$COMMIT_SHA"
+
+          CHANGED_FILES="$(
+            git diff \
+              --name-only \
+              "$BASE_SHA...HEAD"
+          )"
+
+          echo ""
+          echo "Changed files:"
+          echo "----------------------------------------------"
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "$CHANGED_FILES"
+          else
+            echo "No changed files."
+          fi
+
+          echo "----------------------------------------------"
+
+          # ------------------------------------------------------
+          # Detect shared-code changes
+          # (repo-root shared dir, e.g. common/)
+          # ------------------------------------------------------
+
+          if printf '%s\n' "$CHANGED_FILES" |
+            grep -qE '^common/|^_shared/'; then
+
+            echo ""
+            echo "=============================================="
+            echo "Manual function selection required"
+            echo "=============================================="
+            echo ""
+            echo "Shared code changes detected (common/ or _shared/)."
+            echo ""
+            echo "Shared code may affect multiple functions."
+            echo "Please re-run the workflow with:"
+            echo ""
+            echo "functions: HelloWorld,S3ListBuckets,DynamoDbWriter"
+            echo ""
+            exit 1
+          fi
+
+          # ------------------------------------------------------
+          # Detect workflow / repo-config changes
+          # ------------------------------------------------------
+
+          if printf '%s\n' "$CHANGED_FILES" |
+            grep -qE '^\.github/workflows/deploy\.yml$|^\.github/actions/'; then
+
+            echo ""
+            echo "=============================================="
+            echo "Manual function selection required"
+            echo "=============================================="
+            echo ""
+            echo "Deployment workflow/config changes detected."
+            echo ""
+            echo "Please re-run the workflow with:"
+            echo ""
+            echo "functions: HelloWorld,S3ListBuckets,DynamoDbWriter"
+            echo ""
+            exit 1
+          fi
+
+          # ------------------------------------------------------
+          # Detect actual function directories only
+          # (a top-level dir containing lambda_function.py)
+          # ------------------------------------------------------
+
+          FUNCTIONS=""
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+
+            case "$FILE" in
+              */*)
+                FUNCTION="$(printf '%s' "$FILE" | cut -d '/' -f 1)"
+
+                if [ "$FUNCTION" = "common" ] || [ "$FUNCTION" = "_shared" ]; then
+                  continue
+                fi
+
+                if [ -f "$FUNCTION/lambda_function.py" ]; then
+                  FUNCTIONS="${FUNCTIONS}${FUNCTION}"$'\n'
+                fi
+                ;;
+            esac
+          done <<< "$CHANGED_FILES"
+
+          FUNCTIONS="$(
+            printf '%s\n' "$FUNCTIONS" |
+              sed '/^$/d' |
+              sort -u
+          )"
+
+          echo ""
+          echo "Detected functions:"
+          echo "----------------------------------------------"
+
+          if [ -n "$FUNCTIONS" ]; then
+            echo "$FUNCTIONS"
+          else
+            echo "None"
+          fi
+
+          echo "----------------------------------------------"
+
+          # ------------------------------------------------------
+          # No function changes
+          # ------------------------------------------------------
+
+          if [ -z "$FUNCTIONS" ]; then
+            echo ""
+            echo "No Lambda Function changes detected."
+
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "source=diff" >> "$GITHUB_OUTPUT"
+
+            {
+              echo "functions<<EOF"
+              echo ""
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+
+            exit 0
+          fi
+
+          {
+            echo "functions<<EOF"
+            echo "$FUNCTIONS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "source=diff" >> "$GITHUB_OUTPUT"
+
+      # ========================================================
+      # Deploy functions
+      # ========================================================
+
+      - name: Deploy functions
+        id: deploy
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: powershell
+        env:
+          FUNCTIONS: ${{ steps.changes.outputs.functions }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $deployed = @()
+          $failed   = @()
+
+          $env_name = "$env:INPUT_ENVIRONMENT"
+          $region   = "$env:AWS_REGION"
+
+          Write-Host "=============================================="
+          Write-Host "Deploying Functions - $env_name"
+          Write-Host "=============================================="
+
+          $functions = $env:FUNCTIONS -split "`n" | Where-Object { $_.Trim() -ne "" }
+
+          foreach ($function in $functions) {
+            Write-Host ""
+            Write-Host "----------------------------------------------"
+            Write-Host "Deploying: $function ($env_name)"
+            Write-Host "----------------------------------------------"
+
+            try {
+              $fnFull = "$function-$env_name"
+              $buildDir = "build\$function"
+              $pkgPath  = "build\$function-$env_name.zip"
+
+              if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force }
+              if (Test-Path $pkgPath)  { Remove-Item $pkgPath  -Force }
+              New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+
+              # Copy function source
+              Copy-Item -Path "$function\*" -Destination $buildDir -Recurse -Force
+
+              # Strip local-only folders
+              Get-ChildItem -Path $buildDir -Recurse -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -in @('__pycache__','.venv','venv','.pytest_cache','scripts','.git') } |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+              # Install dependencies if requirements.txt exists
+              $reqFile = "$function\requirements.txt"
+              if (Test-Path $reqFile) {
+                Write-Host "Installing dependencies..." -ForegroundColor Cyan
+                python -m pip install --upgrade pip | Out-Null
+                python -m pip install -r $reqFile -t $buildDir `
+                  --platform manylinux2014_x86_64 `
+                  --only-binary=:all: `
+                  --implementation cp `
+                  --python-version 3.12 `
+                  --upgrade
+                if ($LASTEXITCODE -ne 0) { throw "pip install failed for $function" }
+              }
+
+              # Zip
+              Compress-Archive -Path "$buildDir\*" -DestinationPath $pkgPath -Force
+              $pkgFull = (Resolve-Path $pkgPath).Path
+              $sizeKB = [math]::Round((Get-Item $pkgFull).Length / 1KB, 1)
+              Write-Host ("Package: {0} ({1} KB)" -f $pkgFull, $sizeKB) -ForegroundColor Green
+
+              # Ensure function exists
+              aws lambda get-function --function-name $fnFull --region $region 2>$null | Out-Null
+              if ($LASTEXITCODE -ne 0) {
+                throw "Lambda '$fnFull' not found in $region. Create it before deploying."
+              }
+
+              # Upload
+              aws lambda update-function-code `
+                --function-name $fnFull `
+                --zip-file "fileb://$pkgFull" `
+                --region $region
+
+              if ($LASTEXITCODE -ne 0) { throw "update-function-code failed ($LASTEXITCODE)" }
+
+              aws lambda wait function-updated `
+                --function-name $fnFull `
+                --region $region
+
+              if ($LASTEXITCODE -ne 0) { throw "wait function-updated failed ($LASTEXITCODE)" }
+
+              Write-Host "SUCCESS: $function" -ForegroundColor Green
+              $deployed += $function
+            }
+            catch {
+              Write-Host "FAILED: $function — $_" -ForegroundColor Red
+              $failed += $function
+            }
           }
 
-          $outFile = Join-Path $env:RUNNER_TEMP "response-$fn_name.json"
+          $deployedText = ($deployed -join "`n")
+          $failedText   = ($failed   -join "`n")
 
-          Write-Host "Invoking $fn_full..." -ForegroundColor Cyan
-          aws lambda invoke `
-            --function-name $fn_full `
-            --region $region `
-            --payload '{}' `
-            --cli-binary-format raw-in-base64-out `
-            $outFile | Out-Null
+          # Write multiline outputs
+          "deployed<<EOF`n$deployedText`nEOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "failed<<EOF`n$failedText`nEOF"     | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-          if ($LASTEXITCODE -ne 0) { throw "invoke failed ($LASTEXITCODE)" }
+          if ($failed.Count -gt 0) {
+            Write-Host ""
+            Write-Host "One or more functions failed." -ForegroundColor Red
+            exit 1
+          }
 
-          Write-Host "Response:" -ForegroundColor Green
-          Get-Content $outFile
+      # ========================================================
+      # Deployment summary
+      # ========================================================
 
-  # ────────────────────────────────────────────────────────────────
-  # 3. SUMMARY
-  # ────────────────────────────────────────────────────────────────
-  summary:
-    name: Deployment summary
-    needs: [discover, deploy]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Print summary
+      - name: Generate deployment summary
+        if: always()
+        shell: bash
+        env:
+          FUNCTIONS:        ${{ steps.changes.outputs.functions }}
+          DEPLOYED:         ${{ steps.deploy.outputs.deployed }}
+          FAILED:           ${{ steps.deploy.outputs.failed }}
+          HAS_CHANGES:      ${{ steps.changes.outputs.has_changes }}
+          CHANGE_SOURCE:    ${{ steps.changes.outputs.source }}
+          BASE_SHA:         ${{ steps.base.outputs.base }}
+          BASE_OUTCOME:     ${{ steps.base.outcome }}
+          CHANGES_OUTCOME:  ${{ steps.changes.outcome }}
+          DEPLOY_OUTCOME:   ${{ steps.deploy.outcome }}
         run: |
+          set -u
+
+          case "$INPUT_ENVIRONMENT" in
+            prod)    TITLE_EMOJI="🚀"; TITLE_LABEL="Production" ;;
+            staging) TITLE_EMOJI="🧪"; TITLE_LABEL="Staging" ;;
+            *)       TITLE_EMOJI="🧰"; TITLE_LABEL="Dev" ;;
+          esac
+
           {
-            echo "## Lambda Deployment Summary"
+            echo "# ${TITLE_EMOJI} Lambda Functions - ${TITLE_LABEL}"
             echo ""
-            echo "| Field | Value |"
+
+            echo "## Deployment Information"
+            echo ""
+            echo "| Item | Value |"
             echo "|---|---|"
-            echo "| Trigger | \`${{ github.event_name }}\` |"
-            echo "| Mode | \`${{ needs.discover.outputs.mode }}\` |"
-            echo "| Environment | \`${{ github.event.inputs.environment || 'dev' }}\` |"
-            echo "| Functions discovered | ${{ needs.discover.outputs.count }} |"
-            echo "| Deploy result | \`${{ needs.deploy.result }}\` |"
+            echo "| Environment | \`$INPUT_ENVIRONMENT\` |"
+            echo "| Region | \`${AWS_REGION:-not resolved}\` |"
+            echo "| Branch | \`$BRANCH_NAME\` |"
+            echo "| Commit | \`$COMMIT_SHA\` |"
+            echo "| Base | \`${BASE_SHA:-not required}\` |"
+            echo "| Trigger | Manual |"
+            echo "| Detection | \`${CHANGE_SOURCE:-not completed}\` |"
             echo ""
-            echo "### Functions"
-            echo '```json'
-            echo '${{ needs.discover.outputs.functions }}'
-            echo '```'
-          } >> $GITHUB_STEP_SUMMARY
+
+            if [ "${BASE_OUTCOME:-}" = "failure" ]; then
+
+              echo "## ❌ Base Resolution Failed"
+              echo ""
+              echo "The workflow could not determine a comparison base."
+              echo ""
+              echo "For the first deployment, provide either:"
+              echo ""
+              echo "- \`functions: HelloWorld,S3ListBuckets\`"
+              echo "- \`base: <branch/ref/SHA>\`"
+              echo ""
+
+            elif [ "${CHANGES_OUTCOME:-}" = "failure" ]; then
+
+              echo "## ❌ Change Detection Failed"
+              echo ""
+              echo "The workflow could not determine which functions should be deployed."
+              echo ""
+
+            elif [ "${HAS_CHANGES:-false}" != "true" ]; then
+
+              echo "## ℹ️ No Function Changes"
+              echo ""
+              echo "No Lambda Function changes were detected."
+              echo ""
+
+            else
+
+              echo "## Functions"
+              echo ""
+              echo "| Function | Status |"
+              echo "|---|---|"
+
+              if [ -n "${DEPLOYED:-}" ]; then
+                while IFS= read -r FUNCTION; do
+                  [ -z "$FUNCTION" ] && continue
+                  echo "| \`$FUNCTION\` | ✅ Deployed |"
+                done <<< "$DEPLOYED"
+              fi
+
+              if [ -n "${FAILED:-}" ]; then
+                while IFS= read -r FUNCTION; do
+                  [ -z "$FUNCTION" ] && continue
+                  echo "| \`$FUNCTION\` | ❌ Failed |"
+                done <<< "$FAILED"
+              fi
+
+              echo ""
+
+              case "${DEPLOY_OUTCOME:-unknown}" in
+
+                success)
+                  echo "## ✅ Deployment Completed"
+                  echo ""
+                  echo "All selected functions were deployed successfully."
+                  ;;
+
+                failure)
+                  echo "## ❌ Deployment Failed"
+                  echo ""
+                  echo "One or more functions failed to deploy."
+                  ;;
+
+                skipped)
+                  echo "## ⏭️ Deployment Skipped"
+                  echo ""
+                  echo "No deployment was performed."
+                  ;;
+
+                cancelled)
+                  echo "## 🛑 Deployment Cancelled"
+                  echo ""
+                  echo "The deployment was cancelled."
+                  ;;
+
+                *)
+                  echo "## ⚠️ Deployment Did Not Complete"
+                  echo ""
+                  echo "The deployment step did not complete normally."
+                  ;;
+
+              esac
+
+            fi
+
+            echo ""
+            echo "---"
+            echo ""
+            echo "Workflow: \`$GITHUB_WORKFLOW\`"
+            echo "Run: \`$GITHUB_RUN_ID\`"
+
+          } >> "$GITHUB_STEP_SUMMARY"
