@@ -285,23 +285,22 @@ jobs:
             # ----------------------------------------------------
 
             LAST_SUCCESS_SHA="$(
-              echo "$RUNS_JSON" |
-                jq -r --arg ENV "$INPUT_ENVIRONMENT" '
-                  [
-                    .[]
-                    | select(
-                        (.displayTitle // "")
-                        | ascii_downcase
-                        | contains(
-                            ("(" + ($ENV | ascii_downcase) + ")")
-                          )
-                      )
-                  ]
-                  | sort_by(.createdAt)
-                  | reverse
-                  | .[0].headSha // empty
-                '
-            )"
+            echo "$RUNS_JSON" |
+              jq -r --arg ENV "$INPUT_ENVIRONMENT" '
+                [
+                  .[]
+                  | select(
+                      (.displayTitle // "")
+                      | ascii_downcase
+                      | contains(
+                          ("(" + ($ENV | ascii_downcase) + ")")
+                        )
+                    )
+                ]
+                | sort_by(.createdAt)
+                | reverse
+                | .[0].headSha // empty
+          )"
 
             # ----------------------------------------------------
             # Previous deployment found
