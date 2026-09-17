@@ -6,6 +6,7 @@
 #   - Choose environment (dev | staging | prod) via workflow_dispatch
 #   - Deploy only affected Lambda functions
 #   - Detect ANY file change inside a Lambda folder
+#   - Env-aware Lambda name resolution (folder + env -> real name)
 #   - Allow explicit function override
 #   - Allow explicit base ref/SHA
 #   - Generate an accurate deployment summary
@@ -18,15 +19,26 @@
 #   5. Detect changed functions        (git-only)
 #   6. Resolve environment credentials (reads secrets, no AWS call)
 #   7. ONLY IF changes exist:
-#        - Configure AWS credentials (OIDC)   ← first AWS call
+#        - Configure AWS credentials (OIDC)   <- first AWS call
 #        - Verify AWS identity
-#        - Deploy functions
+#        - Resolve env-specific Lambda names
+#        - Build + deploy each function
 #   8. Summary (always)
+#
+# Base resolution:
+#   - If `base` input is provided -> use it (validated).
+#   - Otherwise -> last successful run of this workflow on the
+#     same branch, filtered to the same environment.
+#   - If neither is available -> fail with a clear message.
+#
+# Lambda name resolution (in order):
+#   1. <folder>/deploy.config.json -> .name.<environment>
+#   2. Fallback: <folder>-<environment>
+#   3. Safety: resolved name MUST contain the env token.
 #
 # Important:
 #   - Does NOT use GitHub Environments.
 #   - Secrets are repository-level only.
-#   - The `environment` input is used purely as a switch-case selector.
 #   - AWS authentication uses OIDC (no long-lived keys).
 #
 # Required repository secrets:
@@ -37,13 +49,10 @@
 #
 # Required repository layout:
 #   <FunctionName>/
-#     lambda_function.py     (discovery marker)
-#     requirements.txt       (optional)
+#     lambda_function.py            (discovery marker — required)
+#     requirements.txt              (optional)
+#     deploy.config.json            (optional, per-env Lambda name)
 #     ...any other files
-#
-# A top-level folder is treated as a Lambda function ONLY IF it
-# contains lambda_function.py. ANY changed file inside such a
-# folder triggers deployment of that function.
 # ============================================================
 
 name: Deploy Lambda Functions
@@ -72,8 +81,8 @@ on:
       base:
         description: >-
           Optional base ref/SHA for change detection.
-          Leave empty to use the last successful deployment of this workflow
-          on the selected branch and environment.
+          Leave empty to use the last successful deployment of this
+          workflow on the selected branch and environment.
         required: false
         type: string
         default: ""
@@ -85,6 +94,8 @@ permissions:
 
 jobs:
   deploy:
+    # ⚠️ DO NOT rename this job. The base-resolution step relies on
+    # the "(<environment>)" suffix appearing in the run's displayTitle.
     name: Detect and Deploy Lambda Functions (${{ inputs.environment }})
     runs-on: windows-latest
 
@@ -131,6 +142,14 @@ jobs:
 
       # ========================================================
       # 4. Resolve comparison base  (git-only — no AWS)
+      #
+      # Priority:
+      #   1. Explicit `base` input (validated).
+      #   2. Last successful run of this workflow, same branch,
+      #      same environment (via displayTitle filter).
+      #   3. Fail with a clear message.
+      #
+      # This step is SKIPPED when `functions` is provided.
       # ========================================================
 
       - name: Resolve comparison base
@@ -170,6 +189,7 @@ jobs:
           else
             # ----------------------------------------------------
             # 4.2 Last successful deployment for THIS environment
+            #     on THIS branch
             # ----------------------------------------------------
 
             echo "No base supplied."
@@ -247,8 +267,7 @@ jobs:
       # 5. Detect changed functions  (git-only — no AWS)
       #
       # Detects ANY file change inside a Lambda folder.
-      # A folder is a Lambda if it contains lambda_function.py
-      # at its top level.
+      # A folder is a Lambda if it contains lambda_function.py.
       # ========================================================
 
       - name: Detect changed functions
@@ -475,11 +494,6 @@ jobs:
       #
       # ⚠️ This step ONLY reads secrets and exports env vars.
       # It does NOT call AWS. No OIDC token is exchanged yet.
-      #
-      # Exports:
-      #   AWS_ROLE_ARN  (shared)
-      #   AWS_REGION    (env-specific)
-      # to $GITHUB_ENV for later steps.
       # ========================================================
 
       - name: Resolve environment credentials
@@ -559,8 +573,6 @@ jobs:
 
       # ========================================================
       # 7. Configure AWS credentials (OIDC) — ONLY IF CHANGES EXIST
-      #
-      # This is the first step that actually talks to AWS.
       # ========================================================
 
       - name: Configure AWS credentials (OIDC)
@@ -591,7 +603,68 @@ jobs:
           }
 
       # ========================================================
-      # 7c. Deploy functions — ONLY IF CHANGES EXIST
+      # 7c. Resolve env-specific Lambda names — ONLY IF CHANGES EXIST
+      #
+      # For each changed folder:
+      #   1. If <folder>/deploy.config.json exists -> read .name.<env>
+      #   2. Otherwise -> "<folder>-<env>"
+      #   3. Safety: the resolved name MUST contain the env token.
+      #
+      # Output: mapping (folder<TAB>lambda-name, one per line)
+      # ========================================================
+
+      - name: Resolve env-specific Lambda names
+        id: resolve-names
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          FUNCTIONS: ${{ steps.changes.outputs.functions }}
+        run: |
+          set -euo pipefail
+
+          ENV_NAME="$INPUT_ENVIRONMENT"
+          RESOLVED=""
+
+          echo "=============================================="
+          echo "Resolving Lambda names for: $ENV_NAME"
+          echo "=============================================="
+
+          while IFS= read -r FUNCTION; do
+            [ -z "$FUNCTION" ] && continue
+
+            CFG="$FUNCTION/deploy.config.json"
+            LAMBDA_NAME=""
+
+            if [ -f "$CFG" ]; then
+              LAMBDA_NAME="$(
+                jq -r --arg env "$ENV_NAME" --arg folder "$FUNCTION" \
+                   '.name[$env] // "\($folder)-\($env)"' "$CFG"
+              )"
+            else
+              LAMBDA_NAME="${FUNCTION}-${ENV_NAME}"
+            fi
+
+            # Safety: resolved name MUST contain the env token
+            if ! printf '%s' "$LAMBDA_NAME" | grep -qi -- "$ENV_NAME"; then
+              echo ""
+              echo "ERROR: Resolved Lambda name does not contain env '$ENV_NAME':"
+              echo "  Folder : $FUNCTION"
+              echo "  Name   : $LAMBDA_NAME"
+              exit 1
+            fi
+
+            echo "  $FUNCTION  ->  $LAMBDA_NAME"
+            RESOLVED="${RESOLVED}${FUNCTION}"$'\t'"${LAMBDA_NAME}"$'\n'
+          done <<< "$FUNCTIONS"
+
+          {
+            echo "mapping<<EOF"
+            printf '%b' "$RESOLVED"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ========================================================
+      # 7d. Deploy functions — ONLY IF CHANGES EXIST
       # ========================================================
 
       - name: Deploy functions
@@ -599,7 +672,7 @@ jobs:
         if: steps.changes.outputs.has_changes == 'true'
         shell: powershell
         env:
-          FUNCTIONS: ${{ steps.changes.outputs.functions }}
+          MAPPING: ${{ steps.resolve-names.outputs.mapping }}
         run: |
           $ErrorActionPreference = "Continue"
 
@@ -613,16 +686,36 @@ jobs:
           Write-Host "Deploying Functions - $env_name"
           Write-Host "=============================================="
 
-          $functions = $env:FUNCTIONS -split "`n" | Where-Object { $_.Trim() -ne "" }
+          # Parse "folder<TAB>lambda-name" pairs
+          $pairs = @()
+          foreach ($line in ($env:MAPPING -split "`n")) {
+            if ($line.Trim() -eq "") { continue }
+            $parts = $line -split "`t"
+            if ($parts.Count -ge 2) {
+              $pairs += [pscustomobject]@{
+                Folder = $parts[0].Trim()
+                Lambda = $parts[1].Trim()
+              }
+            }
+          }
 
-          foreach ($function in $functions) {
+          if ($pairs.Count -eq 0) {
+            Write-Host "No functions to deploy." -ForegroundColor Yellow
+            "deployed<<EOF`n`nEOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "failed<<EOF`n`nEOF"   | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+
+          foreach ($pair in $pairs) {
+            $function = $pair.Folder
+            $fnFull   = $pair.Lambda
+
             Write-Host ""
             Write-Host "----------------------------------------------"
-            Write-Host "Deploying: $function ($env_name)"
+            Write-Host "Deploying: $function -> $fnFull ($env_name)"
             Write-Host "----------------------------------------------"
 
             try {
-              $fnFull   = "$function-$env_name"
               $buildDir = "build\$function"
               $pkgPath  = "build\$function-$env_name.zip"
 
@@ -678,12 +771,12 @@ jobs:
 
               if ($LASTEXITCODE -ne 0) { throw "wait function-updated failed ($LASTEXITCODE)" }
 
-              Write-Host "SUCCESS: $function" -ForegroundColor Green
-              $deployed += $function
+              Write-Host "SUCCESS: $function -> $fnFull" -ForegroundColor Green
+              $deployed += "$function -> $fnFull"
             }
             catch {
-              Write-Host "FAILED: $function — $_" -ForegroundColor Red
-              $failed += $function
+              Write-Host "FAILED: $function -> $fnFull — $_" -ForegroundColor Red
+              $failed += "$function -> $fnFull"
             }
           }
 
@@ -709,6 +802,7 @@ jobs:
         env:
           FUNCTIONS:              ${{ steps.changes.outputs.functions }}
           CHANGED_FILES:          ${{ steps.changes.outputs.changed_files }}
+          MAPPING:                ${{ steps.resolve-names.outputs.mapping }}
           DEPLOYED:               ${{ steps.deploy.outputs.deployed }}
           FAILED:                 ${{ steps.deploy.outputs.failed }}
           HAS_CHANGES:            ${{ steps.changes.outputs.has_changes }}
@@ -718,6 +812,7 @@ jobs:
           CHANGES_OUTCOME:        ${{ steps.changes.outcome }}
           AWS_CONFIGURE_OUTCOME:  ${{ steps.configure-aws.outcome }}
           AWS_VERIFY_OUTCOME:     ${{ steps.verify-aws.outcome }}
+          RESOLVE_NAMES_OUTCOME:  ${{ steps.resolve-names.outcome }}
           DEPLOY_OUTCOME:         ${{ steps.deploy.outcome }}
         run: |
           set -u
@@ -776,7 +871,7 @@ jobs:
             else
 
               # --------------------------------------------------
-              # Changed files per function (file-level detail)
+              # Changed files per function
               # --------------------------------------------------
 
               if [ -n "${CHANGED_FILES:-}" ]; then
@@ -804,6 +899,24 @@ jobs:
               fi
 
               # --------------------------------------------------
+              # Resolved Lambda names
+              # --------------------------------------------------
+
+              if [ -n "${MAPPING:-}" ]; then
+                echo "## Resolved Lambda Names"
+                echo ""
+                echo "| Folder | Lambda |"
+                echo "|---|---|"
+
+                while IFS=$'\t' read -r FN LAMBDA; do
+                  [ -z "$FN" ] && continue
+                  echo "| \`$FN\` | \`$LAMBDA\` |"
+                done <<< "$MAPPING"
+
+                echo ""
+              fi
+
+              # --------------------------------------------------
               # AWS authentication status
               # --------------------------------------------------
 
@@ -826,6 +939,13 @@ jobs:
                 *)       echo "| Verify identity | \`${AWS_VERIFY_OUTCOME:-not-run}\` |" ;;
               esac
 
+              case "${RESOLVE_NAMES_OUTCOME:-not-run}" in
+                success) echo "| Resolve Lambda names | ✅ Done |" ;;
+                skipped) echo "| Resolve Lambda names | ⏭️ Skipped |" ;;
+                failure) echo "| Resolve Lambda names | ❌ Failed |" ;;
+                *)       echo "| Resolve Lambda names | \`${RESOLVE_NAMES_OUTCOME:-not-run}\` |" ;;
+              esac
+
               echo ""
 
               # --------------------------------------------------
@@ -838,16 +958,16 @@ jobs:
               echo "|---|---|"
 
               if [ -n "${DEPLOYED:-}" ]; then
-                while IFS= read -r FUNCTION; do
-                  [ -z "$FUNCTION" ] && continue
-                  echo "| \`$FUNCTION\` | ✅ Deployed |"
+                while IFS= read -r LINE; do
+                  [ -z "$LINE" ] && continue
+                  echo "| \`$LINE\` | ✅ Deployed |"
                 done <<< "$DEPLOYED"
               fi
 
               if [ -n "${FAILED:-}" ]; then
-                while IFS= read -r FUNCTION; do
-                  [ -z "$FUNCTION" ] && continue
-                  echo "| \`$FUNCTION\` | ❌ Failed |"
+                while IFS= read -r LINE; do
+                  [ -z "$LINE" ] && continue
+                  echo "| \`$LINE\` | ❌ Failed |"
                 done <<< "$FAILED"
               fi
 
@@ -895,4 +1015,4 @@ jobs:
             echo "Workflow: \`$GITHUB_WORKFLOW\`"
             echo "Run: \`$GITHUB_RUN_ID\`"
 
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "$GITHUB_STEP
