@@ -168,158 +168,158 @@ jobs:
           echo "has_changes=true" >> "$GITHUB_OUTPUT"
           echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
 
-      # # --------------------------------------------------------
-      # # 5. Per-env credentials (same role, different region)
-      # # --------------------------------------------------------
-      # - name: Resolve credentials
-      #   shell: bash
-      #   env:
-      #     ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
-      #     REGION_STAGING: ${{ secrets.AWS_REGION_STAGING }}
-      #     REGION_PROD: ${{ secrets.AWS_REGION_PROD }}
-      #   run: |
-      #     set -euo pipefail
-      #     case "$ENV_NAME" in
-      #       staging)    REGION="$REGION_STAGING" ;;
-      #       production) REGION="$REGION_PROD"    ;;
-      #       *) echo "ERROR: unknown env '$ENV_NAME'"; exit 1 ;;
-      #     esac
-      #     [ -n "$ROLE_ARN" ] || { echo "ERROR: AWS_ROLE_ARN secret not set"; exit 1; }
-      #     [ -n "$REGION"   ] || { echo "ERROR: region secret not set for $ENV_NAME"; exit 1; }
-      #     {
-      #       echo "AWS_ROLE_ARN=$ROLE_ARN"
-      #       echo "AWS_REGION=$REGION"
-      #     } >> "$GITHUB_ENV"
-      #     echo "Region: $REGION"
-
-      # # --------------------------------------------------------
-      # # 6. Assume role via OIDC
-      # # --------------------------------------------------------
-      # - name: Configure AWS credentials
-      #   if: steps.changes.outputs.has_changes == 'true'
-      #   uses: aws-actions/configure-aws-credentials@v5
-      #   with:
-      #     role-to-assume: ${{ env.AWS_ROLE_ARN }}
-      #     aws-region: ${{ env.AWS_REGION }}
-
-      # # --------------------------------------------------------
-      # # 7. Verify the assumed identity
-      # # --------------------------------------------------------
-      # - name: Verify AWS identity
-      #   if: steps.changes.outputs.has_changes == 'true'
-      #   shell: bash
-      #   run: |
-      #     set -euo pipefail
-      #     ARN="$(aws sts get-caller-identity --query Arn --output text)"
-      #     echo "Assumed: $ARN"
-      #     EXPECTED="${AWS_ROLE_ARN##*/}"
-      #     [[ "$ARN" == *"$EXPECTED"* ]] || { echo "ERROR: unexpected role"; exit 1; }
+      # --------------------------------------------------------
+      # 5. Per-env credentials (same role, different region)
+      # --------------------------------------------------------
+      - name: Resolve credentials
+        shell: bash
+        env:
+          ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          REGION_STAGING: ${{ secrets.AWS_REGION_STAGING }}
+          REGION_PROD: ${{ secrets.AWS_REGION_PROD }}
+        run: |
+          set -euo pipefail
+          case "$ENV_NAME" in
+            staging)    REGION="$REGION_STAGING" ;;
+            production) REGION="$REGION_PROD"    ;;
+            *) echo "ERROR: unknown env '$ENV_NAME'"; exit 1 ;;
+          esac
+          [ -n "$ROLE_ARN" ] || { echo "ERROR: AWS_ROLE_ARN secret not set"; exit 1; }
+          [ -n "$REGION"   ] || { echo "ERROR: region secret not set for $ENV_NAME"; exit 1; }
+          {
+            echo "AWS_ROLE_ARN=$ROLE_ARN"
+            echo "AWS_REGION=$REGION"
+          } >> "$GITHUB_ENV"
+          echo "Region: $REGION"
 
       # --------------------------------------------------------
-      # 8. Build + deploy each Lambda
-      #    - Target name = <folder>-<env> (override via
-      #      <folder>/deploy.config.json -> .name[<env>])
-      #    - Only updates existing functions
+      # 6. Assume role via OIDC
       # --------------------------------------------------------
-      # - name: Deploy functions
-      #   id: deploy
-      #   if: steps.changes.outputs.has_changes == 'true'
-      #   shell: bash
-      #   env:
-      #     FUNCTIONS: ${{ steps.changes.outputs.functions }}
-      #   run: |
-      #     # No `set -e`: try every function, fail at the end.
-      #     set -uo pipefail
+      - name: Configure AWS credentials
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      #     DEPLOYED=""
-      #     FAILED=""
+      # --------------------------------------------------------
+      # 7. Verify the assumed identity
+      # --------------------------------------------------------
+      - name: Verify AWS identity
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARN="$(aws sts get-caller-identity --query Arn --output text)"
+          echo "Assumed: $ARN"
+          EXPECTED="${AWS_ROLE_ARN##*/}"
+          [[ "$ARN" == *"$EXPECTED"* ]] || { echo "ERROR: unexpected role"; exit 1; }
 
-      #     while read -r FN; do
-      #       [ -z "$FN" ] && continue
+      --------------------------------------------------------
+      8. Build + deploy each Lambda
+         - Target name = <folder>-<env> (override via
+           <folder>/deploy.config.json -> .name[<env>])
+         - Only updates existing functions
+      --------------------------------------------------------
+      - name: Deploy functions
+        id: deploy
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          FUNCTIONS: ${{ steps.changes.outputs.functions }}
+        run: |
+          # No `set -e`: try every function, fail at the end.
+          set -uo pipefail
 
-      #       CFG="$FN/deploy.config.json"
-      #       if [ -f "$CFG" ]; then
-      #         LAMBDA="$(jq -r --arg e "$ENV_NAME" --arg f "$FN" \
-      #           '.name[$e] // "\($f)-\($e)"' "$CFG")"
-      #       else
-      #         LAMBDA="${FN}-${ENV_NAME}"
-      #       fi
+          DEPLOYED=""
+          FAILED=""
 
-      #       echo "::group::Deploy $FN -> $LAMBDA"
+          while read -r FN; do
+            [ -z "$FN" ] && continue
 
-      #       BUILD="build/$FN"
-      #       ZIP="build/$FN-$ENV_NAME.zip"
-      #       rm -rf "$BUILD" "$ZIP"
-      #       mkdir -p "$BUILD"
-      #       cp -R "$FN"/. "$BUILD"/
+            CFG="$FN/deploy.config.json"
+            if [ -f "$CFG" ]; then
+              LAMBDA="$(jq -r --arg e "$ENV_NAME" --arg f "$FN" \
+                '.name[$e] // "\($f)-\($e)"' "$CFG")"
+            else
+              LAMBDA="${FN}-${ENV_NAME}"
+            fi
 
-      #       find "$BUILD" -type d \
-      #         \( -name '__pycache__' -o -name '.venv' -o -name 'venv' \
-      #         -o -name '.pytest_cache' -o -name '.git' -o -name 'tests' \) \
-      #         -prune -exec rm -rf {} + 2>/dev/null || true
+            echo "::group::Deploy $FN -> $LAMBDA"
 
-      #       if [ -f "$FN/requirements.txt" ]; then
-      #         python -m pip install --upgrade pip >/dev/null
-      #         if ! python -m pip install -r "$FN/requirements.txt" -t "$BUILD" \
-      #               --platform manylinux2014_x86_64 \
-      #               --only-binary=:all: \
-      #               --implementation cp \
-      #               --python-version 3.12 \
-      #               --upgrade; then
-      #           echo "FAILED: pip install"
-      #           FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
-      #           echo "::endgroup::"
-      #           continue
-      #         fi
-      #       fi
+            BUILD="build/$FN"
+            ZIP="build/$FN-$ENV_NAME.zip"
+            rm -rf "$BUILD" "$ZIP"
+            mkdir -p "$BUILD"
+            cp -R "$FN"/. "$BUILD"/
 
-      #       (cd "$BUILD" && zip -qr "../$(basename "$ZIP")" .)
-      #       ZIP_FULL="$(realpath "$ZIP")"
+            find "$BUILD" -type d \
+              \( -name '__pycache__' -o -name '.venv' -o -name 'venv' \
+              -o -name '.pytest_cache' -o -name '.git' -o -name 'tests' \) \
+              -prune -exec rm -rf {} + 2>/dev/null || true
 
-      #       if ! aws lambda get-function --function-name "$LAMBDA" \
-      #             --region "$AWS_REGION" >/dev/null 2>&1; then
-      #         echo "FAILED: '$LAMBDA' not found in $AWS_REGION"
-      #         FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
-      #         echo "::endgroup::"
-      #         continue
-      #       fi
+            if [ -f "$FN/requirements.txt" ]; then
+              python -m pip install --upgrade pip >/dev/null
+              if ! python -m pip install -r "$FN/requirements.txt" -t "$BUILD" \
+                    --platform manylinux2014_x86_64 \
+                    --only-binary=:all: \
+                    --implementation cp \
+                    --python-version 3.12 \
+                    --upgrade; then
+                echo "FAILED: pip install"
+                FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
+                echo "::endgroup::"
+                continue
+              fi
+            fi
 
-      #       if ! aws lambda update-function-code \
-      #             --function-name "$LAMBDA" \
-      #             --zip-file "fileb://$ZIP_FULL" \
-      #             --region "$AWS_REGION" >/dev/null \
-      #         || ! aws lambda wait function-updated \
-      #               --function-name "$LAMBDA" \
-      #               --region "$AWS_REGION"; then
-      #         echo "FAILED: update for $LAMBDA"
-      #         FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
-      #         echo "::endgroup::"
-      #         continue
-      #       fi
+            (cd "$BUILD" && zip -qr "../$(basename "$ZIP")" .)
+            ZIP_FULL="$(realpath "$ZIP")"
 
-      #       echo "OK: $FN -> $LAMBDA"
-      #       DEPLOYED="${DEPLOYED}${FN} -> ${LAMBDA}"$'\n'
-      #       echo "::endgroup::"
-      #     done <<< "$FUNCTIONS"
+            if ! aws lambda get-function --function-name "$LAMBDA" \
+                  --region "$AWS_REGION" >/dev/null 2>&1; then
+              echo "FAILED: '$LAMBDA' not found in $AWS_REGION"
+              FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
+              echo "::endgroup::"
+              continue
+            fi
 
-      #     DEPLOYED="${DEPLOYED%$'\n'}"
-      #     FAILED="${FAILED%$'\n'}"
+            if ! aws lambda update-function-code \
+                  --function-name "$LAMBDA" \
+                  --zip-file "fileb://$ZIP_FULL" \
+                  --region "$AWS_REGION" >/dev/null \
+              || ! aws lambda wait function-updated \
+                    --function-name "$LAMBDA" \
+                    --region "$AWS_REGION"; then
+              echo "FAILED: update for $LAMBDA"
+              FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
+              echo "::endgroup::"
+              continue
+            fi
 
-      #     {
-      #       echo "deployed<<EOF"
-      #       echo "$DEPLOYED"
-      #       echo "EOF"
-      #       echo "failed<<EOF"
-      #       echo "$FAILED"
-      #       echo "EOF"
-      #     } >> "$GITHUB_OUTPUT"
+            echo "OK: $FN -> $LAMBDA"
+            DEPLOYED="${DEPLOYED}${FN} -> ${LAMBDA}"$'\n'
+            echo "::endgroup::"
+          done <<< "$FUNCTIONS"
 
-      #     if [ -n "$FAILED" ]; then
-      #       echo "One or more functions failed."
-      #       exit 1
-      #     fi
+          DEPLOYED="${DEPLOYED%$'\n'}"
+          FAILED="${FAILED%$'\n'}"
 
-      # # --------------------------------------------------------
+          {
+            echo "deployed<<EOF"
+            echo "$DEPLOYED"
+            echo "EOF"
+            echo "failed<<EOF"
+            echo "$FAILED"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$FAILED" ]; then
+            echo "One or more functions failed."
+            exit 1
+          fi
+
+      # --------------------------------------------------------
       # 9. Detailed job summary (always runs)
       # --------------------------------------------------------
       - name: Summary
