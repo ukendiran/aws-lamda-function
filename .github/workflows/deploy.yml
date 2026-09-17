@@ -1,17 +1,14 @@
 name: Deploy to AWS Lambda
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:        # ← this is THE manual trigger
     inputs:
       environment:
         description: "Target environment"
         required: true
         default: "dev"
         type: choice
-        options:
-          - dev
-          - staging
-          - prod
+        options: [dev, staging, prod]
       function:
         description: "Function folder to deploy ('all' for every function)"
         required: true
