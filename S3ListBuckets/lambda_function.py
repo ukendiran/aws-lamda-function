@@ -17,7 +17,6 @@ logger.setLevel(logging.INFO)
 
 s3 = boto3.client("s3")
 
-
 def lambda_handler(event, context):
     logger.info("Event: %s", json.dumps(event, default=str))
 
