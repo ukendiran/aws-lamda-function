@@ -221,105 +221,105 @@ jobs:
       #      <folder>/deploy.config.json -> .name[<env>])
       #    - Only updates existing functions
       # --------------------------------------------------------
-      - name: Deploy functions
-        id: deploy
-        if: steps.changes.outputs.has_changes == 'true'
-        shell: bash
-        env:
-          FUNCTIONS: ${{ steps.changes.outputs.functions }}
-        run: |
-          # No `set -e`: try every function, fail at the end.
-          set -uo pipefail
+      # - name: Deploy functions
+      #   id: deploy
+      #   if: steps.changes.outputs.has_changes == 'true'
+      #   shell: bash
+      #   env:
+      #     FUNCTIONS: ${{ steps.changes.outputs.functions }}
+      #   run: |
+      #     # No `set -e`: try every function, fail at the end.
+      #     set -uo pipefail
 
-          DEPLOYED=""
-          FAILED=""
+      #     DEPLOYED=""
+      #     FAILED=""
 
-          while read -r FN; do
-            [ -z "$FN" ] && continue
+      #     while read -r FN; do
+      #       [ -z "$FN" ] && continue
 
-            CFG="$FN/deploy.config.json"
-            if [ -f "$CFG" ]; then
-              LAMBDA="$(jq -r --arg e "$ENV_NAME" --arg f "$FN" \
-                '.name[$e] // "\($f)-\($e)"' "$CFG")"
-            else
-              LAMBDA="${FN}-${ENV_NAME}"
-            fi
+      #       CFG="$FN/deploy.config.json"
+      #       if [ -f "$CFG" ]; then
+      #         LAMBDA="$(jq -r --arg e "$ENV_NAME" --arg f "$FN" \
+      #           '.name[$e] // "\($f)-\($e)"' "$CFG")"
+      #       else
+      #         LAMBDA="${FN}-${ENV_NAME}"
+      #       fi
 
-            echo "::group::Deploy $FN -> $LAMBDA"
+      #       echo "::group::Deploy $FN -> $LAMBDA"
 
-            BUILD="build/$FN"
-            ZIP="build/$FN-$ENV_NAME.zip"
-            rm -rf "$BUILD" "$ZIP"
-            mkdir -p "$BUILD"
-            cp -R "$FN"/. "$BUILD"/
+      #       BUILD="build/$FN"
+      #       ZIP="build/$FN-$ENV_NAME.zip"
+      #       rm -rf "$BUILD" "$ZIP"
+      #       mkdir -p "$BUILD"
+      #       cp -R "$FN"/. "$BUILD"/
 
-            find "$BUILD" -type d \
-              \( -name '__pycache__' -o -name '.venv' -o -name 'venv' \
-              -o -name '.pytest_cache' -o -name '.git' -o -name 'tests' \) \
-              -prune -exec rm -rf {} + 2>/dev/null || true
+      #       find "$BUILD" -type d \
+      #         \( -name '__pycache__' -o -name '.venv' -o -name 'venv' \
+      #         -o -name '.pytest_cache' -o -name '.git' -o -name 'tests' \) \
+      #         -prune -exec rm -rf {} + 2>/dev/null || true
 
-            if [ -f "$FN/requirements.txt" ]; then
-              python -m pip install --upgrade pip >/dev/null
-              if ! python -m pip install -r "$FN/requirements.txt" -t "$BUILD" \
-                    --platform manylinux2014_x86_64 \
-                    --only-binary=:all: \
-                    --implementation cp \
-                    --python-version 3.12 \
-                    --upgrade; then
-                echo "FAILED: pip install"
-                FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
-                echo "::endgroup::"
-                continue
-              fi
-            fi
+      #       if [ -f "$FN/requirements.txt" ]; then
+      #         python -m pip install --upgrade pip >/dev/null
+      #         if ! python -m pip install -r "$FN/requirements.txt" -t "$BUILD" \
+      #               --platform manylinux2014_x86_64 \
+      #               --only-binary=:all: \
+      #               --implementation cp \
+      #               --python-version 3.12 \
+      #               --upgrade; then
+      #           echo "FAILED: pip install"
+      #           FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
+      #           echo "::endgroup::"
+      #           continue
+      #         fi
+      #       fi
 
-            (cd "$BUILD" && zip -qr "../$(basename "$ZIP")" .)
-            ZIP_FULL="$(realpath "$ZIP")"
+      #       (cd "$BUILD" && zip -qr "../$(basename "$ZIP")" .)
+      #       ZIP_FULL="$(realpath "$ZIP")"
 
-            if ! aws lambda get-function --function-name "$LAMBDA" \
-                  --region "$AWS_REGION" >/dev/null 2>&1; then
-              echo "FAILED: '$LAMBDA' not found in $AWS_REGION"
-              FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
-              echo "::endgroup::"
-              continue
-            fi
+      #       if ! aws lambda get-function --function-name "$LAMBDA" \
+      #             --region "$AWS_REGION" >/dev/null 2>&1; then
+      #         echo "FAILED: '$LAMBDA' not found in $AWS_REGION"
+      #         FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
+      #         echo "::endgroup::"
+      #         continue
+      #       fi
 
-            if ! aws lambda update-function-code \
-                  --function-name "$LAMBDA" \
-                  --zip-file "fileb://$ZIP_FULL" \
-                  --region "$AWS_REGION" >/dev/null \
-              || ! aws lambda wait function-updated \
-                    --function-name "$LAMBDA" \
-                    --region "$AWS_REGION"; then
-              echo "FAILED: update for $LAMBDA"
-              FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
-              echo "::endgroup::"
-              continue
-            fi
+      #       if ! aws lambda update-function-code \
+      #             --function-name "$LAMBDA" \
+      #             --zip-file "fileb://$ZIP_FULL" \
+      #             --region "$AWS_REGION" >/dev/null \
+      #         || ! aws lambda wait function-updated \
+      #               --function-name "$LAMBDA" \
+      #               --region "$AWS_REGION"; then
+      #         echo "FAILED: update for $LAMBDA"
+      #         FAILED="${FAILED}${FN} -> ${LAMBDA}"$'\n'
+      #         echo "::endgroup::"
+      #         continue
+      #       fi
 
-            echo "OK: $FN -> $LAMBDA"
-            DEPLOYED="${DEPLOYED}${FN} -> ${LAMBDA}"$'\n'
-            echo "::endgroup::"
-          done <<< "$FUNCTIONS"
+      #       echo "OK: $FN -> $LAMBDA"
+      #       DEPLOYED="${DEPLOYED}${FN} -> ${LAMBDA}"$'\n'
+      #       echo "::endgroup::"
+      #     done <<< "$FUNCTIONS"
 
-          DEPLOYED="${DEPLOYED%$'\n'}"
-          FAILED="${FAILED%$'\n'}"
+      #     DEPLOYED="${DEPLOYED%$'\n'}"
+      #     FAILED="${FAILED%$'\n'}"
 
-          {
-            echo "deployed<<EOF"
-            echo "$DEPLOYED"
-            echo "EOF"
-            echo "failed<<EOF"
-            echo "$FAILED"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+      #     {
+      #       echo "deployed<<EOF"
+      #       echo "$DEPLOYED"
+      #       echo "EOF"
+      #       echo "failed<<EOF"
+      #       echo "$FAILED"
+      #       echo "EOF"
+      #     } >> "$GITHUB_OUTPUT"
 
-          if [ -n "$FAILED" ]; then
-            echo "One or more functions failed."
-            exit 1
-          fi
+      #     if [ -n "$FAILED" ]; then
+      #       echo "One or more functions failed."
+      #       exit 1
+      #     fi
 
-           # --------------------------------------------------------
+      # # --------------------------------------------------------
       # 9. Detailed job summary (always runs)
       # --------------------------------------------------------
       - name: Summary
